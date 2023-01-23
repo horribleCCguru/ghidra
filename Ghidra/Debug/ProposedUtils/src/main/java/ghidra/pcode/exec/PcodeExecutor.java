@@ -22,6 +22,7 @@ import ghidra.app.plugin.processors.sleigh.SleighLanguage;
 import ghidra.pcode.emu.PcodeEmulator;
 import ghidra.pcode.error.LowlevelError;
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
+import ghidra.pcode.exec.PcodeExecutorStatePiece.Reason;
 import ghidra.pcode.exec.PcodeUseropLibrary.PcodeUseropDefinition;
 import ghidra.pcode.opbehavior.*;
 import ghidra.program.model.address.Address;
@@ -34,7 +35,7 @@ import ghidra.program.model.pcode.Varnode;
  * An executor of p-code programs
  * 
  * <p>
- * This is the kernel of SLEIGH expression evaluation and p-code emulation. For a complete example
+ * This is the kernel of Sleigh expression evaluation and p-code emulation. For a complete example
  * of a p-code emulator, see {@link PcodeEmulator}.
  *
  * @param <T> the type of values processed by the executor
@@ -43,6 +44,7 @@ public class PcodeExecutor<T> {
 	protected final SleighLanguage language;
 	protected final PcodeArithmetic<T> arithmetic;
 	protected final PcodeExecutorState<T> state;
+	protected final Reason reason;
 	protected final Register pc;
 	protected final int pointerSize;
 
@@ -52,19 +54,21 @@ public class PcodeExecutor<T> {
 	 * @param language the processor language
 	 * @param arithmetic an implementation of arithmetic p-code ops
 	 * @param state an implementation of load/store p-code ops
+	 * @param reason a reason for reading the state with this executor
 	 */
 	public PcodeExecutor(SleighLanguage language, PcodeArithmetic<T> arithmetic,
-			PcodeExecutorState<T> state) {
+			PcodeExecutorState<T> state, Reason reason) {
 		this.language = language;
 		this.arithmetic = arithmetic;
 		this.state = state;
+		this.reason = reason;
 
 		this.pc = language.getProgramCounter();
 		this.pointerSize = language.getDefaultSpace().getPointerSize();
 	}
 
 	/**
-	 * Get the executor's SLEIGH language (processor model)
+	 * Get the executor's Sleigh language (processor model)
 	 * 
 	 * @return the language
 	 */
@@ -91,13 +95,22 @@ public class PcodeExecutor<T> {
 	}
 
 	/**
-	 * Compile and execute a line of Sleigh
+	 * Get the reason for reading state with this executor
 	 * 
-	 * @param line the line, excluding the semicolon
+	 * @return the reason
 	 */
-	public void executeSleighLine(String line) {
-		PcodeProgram program = SleighProgramCompiler.compileProgram(language,
-			"line", List.of(line + ";"), PcodeUseropLibrary.NIL);
+	public Reason getReason() {
+		return reason;
+	}
+
+	/**
+	 * Compile and execute a block of Sleigh
+	 * 
+	 * @param source the Sleigh source
+	 */
+	public void executeSleigh(String source) {
+		PcodeProgram program =
+			SleighProgramCompiler.compileProgram(language, "exec", source, PcodeUseropLibrary.NIL);
 		execute(program, PcodeUseropLibrary.nil());
 	}
 
@@ -202,12 +215,12 @@ public class PcodeExecutor<T> {
 			badOp(op);
 			return;
 		}
-		if (b instanceof UnaryOpBehavior) {
-			executeUnaryOp(op, (UnaryOpBehavior) b);
+		if (b instanceof UnaryOpBehavior unOp) {
+			executeUnaryOp(op, unOp);
 			return;
 		}
-		if (b instanceof BinaryOpBehavior) {
-			executeBinaryOp(op, (BinaryOpBehavior) b);
+		if (b instanceof BinaryOpBehavior binOp) {
+			executeBinaryOp(op, binOp);
 			return;
 		}
 		switch (op.getOpcode()) {
@@ -227,7 +240,7 @@ public class PcodeExecutor<T> {
 				executeIndirectBranch(op, frame);
 				return;
 			case PcodeOp.CALL:
-				executeCall(op, frame);
+				executeCall(op, frame, library);
 				return;
 			case PcodeOp.CALLIND:
 				executeIndirectCall(op, frame);
@@ -295,7 +308,7 @@ public class PcodeExecutor<T> {
 	public void executeUnaryOp(PcodeOp op, UnaryOpBehavior b) {
 		Varnode in1Var = op.getInput(0);
 		Varnode outVar = op.getOutput();
-		T in1 = state.getVar(in1Var);
+		T in1 = state.getVar(in1Var, reason);
 		T out = arithmetic.unaryOp(op, in1);
 		state.setVar(outVar, out);
 	}
@@ -310,10 +323,20 @@ public class PcodeExecutor<T> {
 		Varnode in1Var = op.getInput(0);
 		Varnode in2Var = op.getInput(1);
 		Varnode outVar = op.getOutput();
-		T in1 = state.getVar(in1Var);
-		T in2 = state.getVar(in2Var);
+		T in1 = state.getVar(in1Var, reason);
+		T in2 = state.getVar(in2Var, reason);
 		T out = arithmetic.binaryOp(op, in1, in2);
 		state.setVar(outVar, out);
+	}
+
+	/**
+	 * Extension point: logic preceding a load
+	 * 
+	 * @param space the address space to be loaded from
+	 * @param offset the offset about to be loaded from
+	 * @param size the size in bytes to be loaded
+	 */
+	protected void checkLoad(AddressSpace space, T offset, int size) {
 	}
 
 	/**
@@ -325,13 +348,24 @@ public class PcodeExecutor<T> {
 		int spaceID = getIntConst(op.getInput(0));
 		AddressSpace space = language.getAddressFactory().getAddressSpace(spaceID);
 		Varnode inOffset = op.getInput(1);
-		T offset = state.getVar(inOffset);
-		Varnode outvar = op.getOutput();
+		T offset = state.getVar(inOffset, reason);
+		Varnode outVar = op.getOutput();
+		checkLoad(space, offset, outVar.getSize());
 
-		T out = state.getVar(space, offset, outvar.getSize(), true);
-		T mod = arithmetic.modAfterLoad(outvar.getSize(), inOffset.getSize(), offset,
-			outvar.getSize(), out);
-		state.setVar(outvar, mod);
+		T out = state.getVar(space, offset, outVar.getSize(), true, reason);
+		T mod = arithmetic.modAfterLoad(outVar.getSize(), inOffset.getSize(), offset,
+			outVar.getSize(), out);
+		state.setVar(outVar, mod);
+	}
+
+	/**
+	 * Extension point: logic preceding a store
+	 * 
+	 * @param space the address space to be stored to
+	 * @param offset the offset about to be stored to
+	 * @param size the size in bytes to be stored
+	 */
+	protected void checkStore(AddressSpace space, T offset, int size) {
 	}
 
 	/**
@@ -343,10 +377,11 @@ public class PcodeExecutor<T> {
 		int spaceID = getIntConst(op.getInput(0));
 		AddressSpace space = language.getAddressFactory().getAddressSpace(spaceID);
 		Varnode inOffset = op.getInput(1);
-		T offset = state.getVar(inOffset);
+		T offset = state.getVar(inOffset, reason);
 		Varnode valVar = op.getInput(2);
+		checkStore(space, offset, valVar.getSize());
 
-		T val = state.getVar(valVar);
+		T val = state.getVar(valVar, reason);
 		T mod = arithmetic.modBeforeStore(valVar.getSize(), inOffset.getSize(), offset,
 			valVar.getSize(), val);
 		state.setVar(space, offset, valVar.getSize(), true, mod);
@@ -425,7 +460,7 @@ public class PcodeExecutor<T> {
 	 */
 	public void executeConditionalBranch(PcodeOp op, PcodeFrame frame) {
 		Varnode condVar = op.getInput(1);
-		T cond = state.getVar(condVar);
+		T cond = state.getVar(condVar, reason);
 		if (arithmetic.isTrue(cond, Purpose.CONDITION)) {
 			doExecuteBranch(op, frame);
 		}
@@ -444,7 +479,7 @@ public class PcodeExecutor<T> {
 	 * @param frame the frame
 	 */
 	protected void doExecuteIndirectBranch(PcodeOp op, PcodeFrame frame) {
-		T offset = state.getVar(op.getInput(0));
+		T offset = state.getVar(op.getInput(0), reason);
 		branchToOffset(offset, frame);
 
 		long concrete = arithmetic.toLong(offset, Purpose.BRANCH);
@@ -473,7 +508,7 @@ public class PcodeExecutor<T> {
 	 * @param op the op
 	 * @param frame the frame
 	 */
-	public void executeCall(PcodeOp op, PcodeFrame frame) {
+	public void executeCall(PcodeOp op, PcodeFrame frame, PcodeUseropLibrary<T> library) {
 		Address target = op.getInput(0).getAddress();
 		branchToOffset(arithmetic.fromConst(target.getOffset(), pointerSize), frame);
 		branchToAddress(target);

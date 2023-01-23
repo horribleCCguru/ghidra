@@ -29,8 +29,6 @@ import java.util.function.Function;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.google.common.collect.Range;
-
 import generic.Unique;
 import ghidra.app.plugin.assembler.Assembler;
 import ghidra.app.plugin.assembler.Assemblers;
@@ -46,7 +44,6 @@ import ghidra.app.plugin.core.debug.service.model.launch.DebuggerProgramLaunchOf
 import ghidra.app.plugin.core.debug.service.model.launch.DebuggerProgramLaunchOffer.LaunchResult;
 import ghidra.app.script.GhidraState;
 import ghidra.app.services.*;
-import ghidra.app.services.DebuggerStateEditingService.StateEditingMode;
 import ghidra.app.services.LogicalBreakpoint.State;
 import ghidra.dbg.DebuggerModelFactory;
 import ghidra.dbg.DebuggerObjectModel;
@@ -60,6 +57,7 @@ import ghidra.program.model.lang.*;
 import ghidra.program.model.listing.Program;
 import ghidra.trace.database.memory.DBTraceMemoryManager;
 import ghidra.trace.database.memory.DBTraceMemorySpace;
+import ghidra.trace.model.Lifespan;
 import ghidra.trace.model.Trace;
 import ghidra.trace.model.breakpoint.TraceBreakpointKind;
 import ghidra.trace.model.breakpoint.TraceBreakpointKind.TraceBreakpointKindSet;
@@ -415,7 +413,7 @@ public class FlatDebuggerAPITest extends AbstractGhidraHeadedDebuggerGUITest {
 					.createRegion("Memory[bin.text]", 0, tb.range(0x00400000, 0x00400fff),
 						Set.of(TraceMemoryFlag.READ, TraceMemoryFlag.EXECUTE));
 			changesSettled = mappingService.changesSettled();
-			mappingService.addIdentityMapping(tb.trace, program, Range.atLeast(0L), true);
+			mappingService.addIdentityMapping(tb.trace, program, Lifespan.nowOn(0), true);
 		}
 		waitForSwing();
 		waitOn(changesSettled);
@@ -691,7 +689,7 @@ public class FlatDebuggerAPITest extends AbstractGhidraHeadedDebuggerGUITest {
 	@Test
 	public void testWriteMemoryGivenContext() throws Throwable {
 		createTraceWithBinText();
-		editingService.setCurrentMode(tb.trace, StateEditingMode.WRITE_TRACE);
+		editingService.setCurrentMode(tb.trace, StateEditingMode.RW_TRACE);
 
 		assertTrue(flat.writeMemory(tb.trace, 0, tb.addr(0x00400123), tb.arr(3, 2, 1)));
 		ByteBuffer buf = ByteBuffer.allocate(3);
@@ -702,7 +700,7 @@ public class FlatDebuggerAPITest extends AbstractGhidraHeadedDebuggerGUITest {
 	@Test
 	public void testWriteMemoryCurrentContext() throws Throwable {
 		createTraceWithBinText();
-		editingService.setCurrentMode(tb.trace, StateEditingMode.WRITE_TRACE);
+		editingService.setCurrentMode(tb.trace, StateEditingMode.RW_TRACE);
 
 		assertTrue(flat.writeMemory(tb.addr(0x00400123), tb.arr(3, 2, 1)));
 		ByteBuffer buf = ByteBuffer.allocate(3);
@@ -713,7 +711,7 @@ public class FlatDebuggerAPITest extends AbstractGhidraHeadedDebuggerGUITest {
 	@Test
 	public void testWriteRegisterGivenContext() throws Throwable {
 		TraceThread thread = createTraceWithThreadAndStack(true);
-		editingService.setCurrentMode(tb.trace, StateEditingMode.WRITE_TRACE);
+		editingService.setCurrentMode(tb.trace, StateEditingMode.RW_TRACE);
 		traceManager.activateThread(thread);
 		waitForSwing();
 
@@ -729,7 +727,7 @@ public class FlatDebuggerAPITest extends AbstractGhidraHeadedDebuggerGUITest {
 	@Test
 	public void testWriteRegisterCurrentContext() throws Throwable {
 		TraceThread thread = createTraceWithThreadAndStack(true);
-		editingService.setCurrentMode(tb.trace, StateEditingMode.WRITE_TRACE);
+		editingService.setCurrentMode(tb.trace, StateEditingMode.RW_TRACE);
 		traceManager.activateThread(thread);
 		waitForSwing();
 

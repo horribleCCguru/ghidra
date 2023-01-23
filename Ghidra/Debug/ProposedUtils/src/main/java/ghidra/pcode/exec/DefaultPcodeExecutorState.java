@@ -15,9 +15,13 @@
  */
 package ghidra.pcode.exec;
 
+import java.util.Map;
+
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.MemBuffer;
 
 /**
@@ -46,13 +50,8 @@ public class DefaultPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	}
 
 	@Override
-	public T getVar(AddressSpace space, T offset, int size, boolean quantize) {
-		return piece.getVar(space, offset, size, quantize);
-	}
-
-	@Override
-	public void setVar(AddressSpace space, T offset, int size, boolean quantize, T val) {
-		piece.setVar(space, offset, size, quantize, val);
+	public Language getLanguage() {
+		return piece.getLanguage();
 	}
 
 	@Override
@@ -61,7 +60,32 @@ public class DefaultPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	}
 
 	@Override
+	public DefaultPcodeExecutorState<T> fork() {
+		return new DefaultPcodeExecutorState<>(piece.fork(), arithmetic);
+	}
+
+	@Override
+	public T getVar(AddressSpace space, T offset, int size, boolean quantize, Reason reason) {
+		return piece.getVar(space, offset, size, quantize, reason);
+	}
+
+	@Override
+	public void setVar(AddressSpace space, T offset, int size, boolean quantize, T val) {
+		piece.setVar(space, offset, size, quantize, val);
+	}
+
+	@Override
+	public Map<Register, T> getRegisterValues() {
+		return piece.getRegisterValues();
+	}
+
+	@Override
 	public MemBuffer getConcreteBuffer(Address address, Purpose purpose) {
 		return piece.getConcreteBuffer(address, purpose);
+	}
+
+	@Override
+	public void clear() {
+		piece.clear();
 	}
 }

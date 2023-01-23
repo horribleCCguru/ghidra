@@ -38,9 +38,8 @@ import ghidra.util.DataConverter;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
-import ghidra.util.task.TaskMonitorAdapter;
 
-public class OmfLoader extends AbstractLibrarySupportLoader {
+public class OmfLoader extends AbstractProgramWrapperLoader {
 	public final static String OMF_NAME = "Relocatable Object Module Format (OMF)";
 	public final static long MIN_BYTE_LENGTH = 11;
 	public final static long IMAGE_BASE = 0x2000; // Base offset to start loading segments
@@ -85,7 +84,7 @@ public class OmfLoader extends AbstractLibrarySupportLoader {
 			reader.setPointerIndex(0);
 			OmfFileHeader scan;
 			try {
-				scan = OmfFileHeader.scan(reader, TaskMonitorAdapter.DUMMY_MONITOR, true);
+				scan = OmfFileHeader.scan(reader, TaskMonitor.DUMMY, true);
 			}
 			catch (OmfException e) {
 				throw new IOException("Bad header format: " + e.getMessage());
@@ -115,7 +114,7 @@ public class OmfLoader extends AbstractLibrarySupportLoader {
 		OmfFileHeader header = null;
 		BinaryReader reader = OmfFileHeader.createReader(provider);
 		try {
-			header = OmfFileHeader.parse(reader, monitor);
+			header = OmfFileHeader.parse(reader, monitor, log);
 			header.resolveNames();
 			header.sortSegmentDataBlocks();
 			OmfFileHeader.doLinking(IMAGE_BASE, header.getSegments(), header.getGroups());
@@ -284,7 +283,6 @@ public class OmfLoader extends AbstractLibrarySupportLoader {
 	 * @param reader is a reader for the underlying file
 	 * @param header is the OMF file header
 	 * @param program is the Program
-	 * @param mbu is the block creation utility
 	 * @param monitor is checked for cancellation
 	 * @param log receives error messages
 	 * @throws AddressOverflowException if the underlying data stream causes an address to wrap

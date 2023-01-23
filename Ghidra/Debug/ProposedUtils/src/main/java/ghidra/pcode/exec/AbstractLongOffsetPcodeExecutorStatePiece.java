@@ -16,10 +16,13 @@
 package ghidra.pcode.exec;
 
 import java.util.*;
+import java.util.Map.Entry;
+import java.util.stream.Collectors;
 
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Register;
 
 /**
  * An abstract executor state piece which internally uses {@code long} to address contents
@@ -41,12 +44,47 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * @param <S> the type of object for each address space
 	 */
 	public abstract static class AbstractSpaceMap<S> {
-		protected final Map<AddressSpace, S> spaces = new HashMap<>();
+		protected final Map<AddressSpace, S> spaces;
+
+		public AbstractSpaceMap() {
+			this.spaces = new HashMap<>();
+		}
+
+		protected AbstractSpaceMap(Map<AddressSpace, S> spaces) {
+			this.spaces = spaces;
+		}
 
 		public abstract S getForSpace(AddressSpace space, boolean toWrite);
 
 		public Collection<S> values() {
 			return spaces.values();
+		}
+
+		/**
+		 * Deep copy this map, for use in a forked state (or piece)
+		 * 
+		 * @return the copy
+		 */
+		public abstract AbstractSpaceMap<S> fork();
+
+		/**
+		 * Deep copy the given space
+		 * 
+		 * @param s the space
+		 * @return the copy
+		 */
+		public abstract S fork(S s);
+
+		/**
+		 * Produce a deep copy of the given map
+		 * 
+		 * @param spaces the map to copy
+		 * @return the copy
+		 */
+		public Map<AddressSpace, S> fork(Map<AddressSpace, S> spaces) {
+			return spaces.entrySet()
+					.stream()
+					.collect(Collectors.toMap(Entry::getKey, e -> fork(e.getValue())));
 		}
 	}
 
@@ -56,6 +94,14 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * @param <S> the type of object for each address space
 	 */
 	public abstract static class SimpleSpaceMap<S> extends AbstractSpaceMap<S> {
+		public SimpleSpaceMap() {
+			super();
+		}
+
+		protected SimpleSpaceMap(Map<AddressSpace, S> spaces) {
+			super(spaces);
+		}
+
 		/**
 		 * Construct a new space internally associated with the given address space
 		 * 
@@ -68,7 +114,7 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 		protected abstract S newSpace(AddressSpace space);
 
 		@Override
-		public S getForSpace(AddressSpace space, boolean toWrite) {
+		public synchronized S getForSpace(AddressSpace space, boolean toWrite) {
 			return spaces.computeIfAbsent(space, s -> newSpace(s));
 		}
 	}
@@ -80,6 +126,14 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * @param <S> the type of cache for each address space
 	 */
 	public abstract static class CacheingSpaceMap<B, S> extends AbstractSpaceMap<S> {
+		public CacheingSpaceMap() {
+			super();
+		}
+
+		protected CacheingSpaceMap(Map<AddressSpace, S> spaces) {
+			super(spaces);
+		}
+
 		/**
 		 * Get the object backing the cache for the given address space
 		 * 
@@ -102,7 +156,7 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 		protected abstract S newSpace(AddressSpace space, B backing);
 
 		@Override
-		public S getForSpace(AddressSpace space, boolean toWrite) {
+		public synchronized S getForSpace(AddressSpace space, boolean toWrite) {
 			return spaces.computeIfAbsent(space,
 				s -> newSpace(s, s.isUniqueSpace() ? null : getBacking(s)));
 		}
@@ -125,6 +179,11 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 		this.addressArithmetic = addressArithmetic;
 		this.arithmetic = arithmetic;
 		uniqueSpace = language.getAddressFactory().getUniqueSpace();
+	}
+
+	@Override
+	public Language getLanguage() {
+		return language;
 	}
 
 	@Override
@@ -161,11 +220,12 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * 
 	 * @param offset the offset in unique space to get the value
 	 * @param size the number of bytes to read (the size of the value)
+	 * @param reason the reason for reading state
 	 * @return the read value
 	 */
-	protected T getUnique(long offset, int size) {
+	protected T getUnique(long offset, int size, Reason reason) {
 		S s = getForSpace(uniqueSpace, false);
-		return getFromSpace(s, offset, size);
+		return getFromSpace(s, offset, size, reason);
 	}
 
 	/**
@@ -195,9 +255,10 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * @param space the address space
 	 * @param offset the offset within the space
 	 * @param size the number of bytes to read (the size of the value)
+	 * @param reason the reason for reading state
 	 * @return the read value
 	 */
-	protected abstract T getFromSpace(S space, long offset, int size);
+	protected abstract T getFromSpace(S space, long offset, int size, Reason reason);
 
 	/**
 	 * In case spaces are generated lazily, and we're reading from a space that doesn't yet exist,
@@ -207,9 +268,10 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	 * By default, the returned value is 0, which should be reasonable for all implementations.
 	 * 
 	 * @param size the number of bytes to read (the size of the value)
+	 * @param reason the reason for reading state
 	 * @return the default value
 	 */
-	protected T getFromNullSpace(int size) {
+	protected T getFromNullSpace(int size, Reason reason) {
 		return arithmetic.fromConst(0, size);
 	}
 
@@ -235,25 +297,51 @@ public abstract class AbstractLongOffsetPcodeExecutorStatePiece<A, T, S>
 	}
 
 	@Override
-	public T getVar(AddressSpace space, A offset, int size, boolean quantize) {
+	public T getVar(AddressSpace space, A offset, int size, boolean quantize, Reason reason) {
 		long lOffset = addressArithmetic.toLong(offset, Purpose.LOAD);
-		return getVar(space, lOffset, size, quantize);
+		return getVar(space, lOffset, size, quantize, reason);
 	}
 
 	@Override
-	public T getVar(AddressSpace space, long offset, int size, boolean quantize) {
+	public T getVar(AddressSpace space, long offset, int size, boolean quantize,
+			Reason reason) {
 		checkRange(space, offset, size);
 		if (space.isConstantSpace()) {
 			return arithmetic.fromConst(offset, size);
 		}
 		if (space.isUniqueSpace()) {
-			return getUnique(offset, size);
+			return getUnique(offset, size, reason);
 		}
 		S s = getForSpace(space, false);
 		if (s == null) {
-			return getFromNullSpace(size);
+			return getFromNullSpace(size, reason);
 		}
 		offset = quantizeOffset(space, offset);
-		return getFromSpace(s, offset, size);
+		return getFromSpace(s, offset, size, reason);
+	}
+
+	/**
+	 * Can the given space for register values, as in {@link #getRegisterValues()}
+	 * 
+	 * @param s the space to scan
+	 * @param registers the registers known to be in the corresponding address space
+	 * @return the map of registers to values
+	 */
+	protected abstract Map<Register, T> getRegisterValuesFromSpace(S s, List<Register> registers);
+
+	@Override
+	public Map<Register, T> getRegisterValues() {
+		Map<AddressSpace, List<Register>> regsBySpace = language.getRegisters()
+				.stream()
+				.collect(Collectors.groupingBy(Register::getAddressSpace));
+		Map<Register, T> result = new HashMap<>();
+		for (Map.Entry<AddressSpace, List<Register>> ent : regsBySpace.entrySet()) {
+			S s = getForSpace(ent.getKey(), false);
+			if (s == null) {
+				continue;
+			}
+			result.putAll(getRegisterValuesFromSpace(s, ent.getValue()));
+		}
+		return result;
 	}
 }

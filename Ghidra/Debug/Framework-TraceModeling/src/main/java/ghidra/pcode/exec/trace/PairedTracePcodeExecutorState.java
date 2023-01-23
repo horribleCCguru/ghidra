@@ -18,8 +18,7 @@ package ghidra.pcode.exec.trace;
 import org.apache.commons.lang3.tuple.Pair;
 
 import ghidra.pcode.exec.PairedPcodeExecutorState;
-import ghidra.trace.model.Trace;
-import ghidra.trace.model.thread.TraceThread;
+import ghidra.pcode.exec.trace.data.PcodeTraceDataAccess;
 
 /**
  * A trace-bound state composed of another trace-bound state and a piece
@@ -31,25 +30,30 @@ import ghidra.trace.model.thread.TraceThread;
 public class PairedTracePcodeExecutorState<L, R> extends PairedPcodeExecutorState<L, R>
 		implements TracePcodeExecutorState<Pair<L, R>> {
 
-	private final TracePcodeExecutorStatePiece<L, L> left;
-	private final TracePcodeExecutorStatePiece<L, R> right;
+	private final PairedTracePcodeExecutorStatePiece<L, L, R> piece;
 
 	public PairedTracePcodeExecutorState(PairedTracePcodeExecutorStatePiece<L, L, R> piece) {
 		super(piece);
-		this.left = piece.getLeft();
-		this.right = piece.getRight();
+		this.piece = piece;
 	}
 
 	public PairedTracePcodeExecutorState(TracePcodeExecutorState<L> left,
 			TracePcodeExecutorStatePiece<L, R> right) {
-		super(left, right);
-		this.left = left;
-		this.right = right;
+		this(new PairedTracePcodeExecutorStatePiece<>(left, right));
 	}
 
 	@Override
-	public void writeDown(Trace trace, long snap, TraceThread thread, int frame) {
-		left.writeDown(trace, snap, thread, frame);
-		right.writeDown(trace, snap, thread, frame);
+	public PcodeTraceDataAccess getData() {
+		return piece.getData();
+	}
+
+	@Override
+	public PairedTracePcodeExecutorState<L, R> fork() {
+		return new PairedTracePcodeExecutorState<>(piece.fork());
+	}
+
+	@Override
+	public void writeDown(PcodeTraceDataAccess into) {
+		piece.writeDown(into);
 	}
 }

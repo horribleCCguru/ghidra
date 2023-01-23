@@ -15,13 +15,15 @@
  */
 package ghidra.pcode.emu;
 
-import java.util.Objects;
+import java.util.*;
 
 import ghidra.pcode.exec.PcodeArithmetic;
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.pcode.exec.PcodeExecutorState;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.MemBuffer;
 
 /**
@@ -44,6 +46,7 @@ public class ThreadPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	 */
 	public ThreadPcodeExecutorState(PcodeExecutorState<T> sharedState,
 			PcodeExecutorState<T> localState) {
+		assert Objects.equals(sharedState.getLanguage(), localState.getLanguage());
 		assert Objects.equals(sharedState.getArithmetic(), localState.getArithmetic());
 		this.sharedState = sharedState;
 		this.localState = localState;
@@ -51,8 +54,18 @@ public class ThreadPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	}
 
 	@Override
+	public Language getLanguage() {
+		return sharedState.getLanguage();
+	}
+
+	@Override
 	public PcodeArithmetic<T> getArithmetic() {
 		return arithmetic;
+	}
+
+	@Override
+	public ThreadPcodeExecutorState<T> fork() {
+		return new ThreadPcodeExecutorState<>(sharedState.fork(), localState.fork());
 	}
 
 	/**
@@ -75,11 +88,19 @@ public class ThreadPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	}
 
 	@Override
-	public T getVar(AddressSpace space, T offset, int size, boolean quantize) {
+	public T getVar(AddressSpace space, T offset, int size, boolean quantize, Reason reason) {
 		if (isThreadLocalSpace(space)) {
-			return localState.getVar(space, offset, size, quantize);
+			return localState.getVar(space, offset, size, quantize, reason);
 		}
-		return sharedState.getVar(space, offset, size, quantize);
+		return sharedState.getVar(space, offset, size, quantize, reason);
+	}
+
+	@Override
+	public Map<Register, T> getRegisterValues() {
+		Map<Register, T> result = new HashMap<>();
+		result.putAll(localState.getRegisterValues());
+		result.putAll(sharedState.getRegisterValues());
+		return result;
 	}
 
 	@Override
@@ -104,5 +125,18 @@ public class ThreadPcodeExecutorState<T> implements PcodeExecutorState<T> {
 	 */
 	public PcodeExecutorState<T> getLocalState() {
 		return localState;
+	}
+
+	/**
+	 * {@inheritDoc}
+	 * 
+	 * <p>
+	 * This will only clear the thread's local state, lest we invoke clear on the shared state for
+	 * every thread. Instead, if necessary, the machine should clear its local state then clear each
+	 * thread's local state.
+	 */
+	@Override
+	public void clear() {
+		localState.clear();
 	}
 }

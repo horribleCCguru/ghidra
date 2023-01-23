@@ -15,7 +15,8 @@
  */
 package ghidra.app.plugin.core.debug.gui.model;
 
-import java.awt.*;
+import java.awt.BorderLayout;
+import java.awt.KeyboardFocusManager;
 import java.awt.event.*;
 import java.lang.invoke.MethodHandles;
 import java.util.List;
@@ -27,20 +28,21 @@ import javax.swing.*;
 import docking.*;
 import docking.action.DockingAction;
 import docking.action.ToggleDockingAction;
+import docking.widgets.table.RangeCursorTableHeaderRenderer.SeekListener;
 import docking.widgets.tree.support.GTreeSelectionEvent.EventOrigin;
+import generic.theme.GColor;
 import ghidra.app.plugin.core.debug.DebuggerCoordinates;
 import ghidra.app.plugin.core.debug.DebuggerPluginPackage;
 import ghidra.app.plugin.core.debug.gui.DebuggerResources;
 import ghidra.app.plugin.core.debug.gui.DebuggerResources.*;
 import ghidra.app.plugin.core.debug.gui.MultiProviderSaveBehavior.SaveableProvider;
+import ghidra.app.plugin.core.debug.gui.model.AbstractQueryTablePanel.CellActivationListener;
 import ghidra.app.plugin.core.debug.gui.model.ObjectTableModel.ObjectRow;
 import ghidra.app.plugin.core.debug.gui.model.ObjectTableModel.ValueRow;
 import ghidra.app.plugin.core.debug.gui.model.ObjectTreeModel.AbstractNode;
 import ghidra.app.plugin.core.debug.gui.model.PathTableModel.PathRow;
 import ghidra.app.services.DebuggerTraceManagerService;
-import ghidra.framework.options.AutoOptions;
 import ghidra.framework.options.SaveState;
-import ghidra.framework.options.annotation.*;
 import ghidra.framework.plugintool.AutoConfigState;
 import ghidra.framework.plugintool.AutoService;
 import ghidra.framework.plugintool.annotation.AutoConfigStateField;
@@ -50,7 +52,8 @@ import ghidra.trace.model.target.*;
 import ghidra.util.Msg;
 
 public class DebuggerModelProvider extends ComponentProvider implements SaveableProvider {
-
+	private static final GColor COLOR_BORDER_DISCONNECTED =
+		new GColor("color.border.provider.disconnected");
 	private static final AutoConfigState.ClassHandler<DebuggerModelProvider> CONFIG_STATE_HANDLER =
 		AutoConfigState.wireHandler(DebuggerModelProvider.class, MethodHandles.lookup());
 	private static final String KEY_DEBUGGER_COORDINATES = "DebuggerCoordinates";
@@ -75,21 +78,6 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 	@SuppressWarnings("unused")
 	private final AutoService.Wiring autoServiceWiring;
 
-	@AutoOptionDefined(
-		description = "Text color for values that have just changed",
-		name = DebuggerResources.OPTION_NAME_COLORS_VALUE_CHANGED,
-		help = @HelpInfo(anchor = "colors"))
-	private Color diffColor = DebuggerResources.DEFAULT_COLOR_VALUE_CHANGED;
-
-	@AutoOptionDefined(
-		description = "Select text color for values that have just changed",
-		name = DebuggerResources.OPTION_NAME_COLORS_VALUE_CHANGED_SEL,
-		help = @HelpInfo(anchor = "colors"))
-	private Color diffColorSel = DebuggerResources.DEFAULT_COLOR_VALUE_CHANGED_SEL;
-
-	@SuppressWarnings("unused")
-	private final AutoOptions.Wiring autoOptionsWiring;
-
 	@AutoConfigStateField
 	private boolean limitToSnap = false;
 	@AutoConfigStateField
@@ -105,16 +93,25 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 	ToggleDockingAction actionShowPrimitivesInTree;
 	ToggleDockingAction actionShowMethodsInTree;
 	DockingAction actionFollowLink;
-	// TODO: Remove stopgap
-	DockingAction actionStepBackward;
-	DockingAction actionStepForward;
 
 	DebuggerObjectActionContext myActionContext;
+
+	private final CellActivationListener elementActivationListener =
+		table -> activatedElementsTable();
+	private final CellActivationListener attributeActivationListener =
+		table -> activatedAttributesTable();
+
+	private final SeekListener seekListener = pos -> {
+		long snap = Math.round(pos);
+		if (current.getTrace() == null || snap < 0) {
+			snap = 0;
+		}
+		traceManager.activateSnap(snap);
+	};
 
 	public DebuggerModelProvider(DebuggerModelPlugin plugin, boolean isClone) {
 		super(plugin.getTool(), DebuggerResources.TITLE_PROVIDER_MODEL, plugin.getName());
 		this.autoServiceWiring = AutoService.wireServicesConsumed(plugin, this);
-		this.autoOptionsWiring = AutoOptions.wireOptions(plugin, this);
 		this.plugin = plugin;
 		this.isClone = isClone;
 
@@ -131,7 +128,7 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 			setTitle("[" + DebuggerResources.TITLE_PROVIDER_MODEL + "]");
 			setWindowGroup("Debugger.Core.disconnected");
 			setIntraGroupPosition(WindowPosition.STACK);
-			mainPanel.setBorder(BorderFactory.createLineBorder(Color.ORANGE, 2));
+			mainPanel.setBorder(BorderFactory.createLineBorder(COLOR_BORDER_DISCONNECTED, 2));
 			setTransient();
 		}
 		else {
@@ -311,44 +308,11 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 			}
 		});
 
-		elementsTablePanel.addMouseListener(new MouseAdapter() {
-			@Override
-			public void mouseClicked(MouseEvent e) {
-				if (e.getClickCount() != 2 || e.getButton() != MouseEvent.BUTTON1) {
-					return;
-				}
-				activatedElementsTable();
-			}
-		});
-		elementsTablePanel.addKeyListener(new KeyAdapter() {
-			@Override
-			public void keyPressed(KeyEvent e) {
-				if (e.getKeyCode() != KeyEvent.VK_ENTER) {
-					return;
-				}
-				activatedElementsTable();
-				e.consume();
-			}
-		});
-		attributesTablePanel.addMouseListener(new MouseAdapter() {
-			@Override
-			public void mouseClicked(MouseEvent e) {
-				if (e.getClickCount() != 2 || e.getButton() != MouseEvent.BUTTON1) {
-					return;
-				}
-				activatedAttributesTable();
-			}
-		});
-		attributesTablePanel.addKeyListener(new KeyAdapter() {
-			@Override
-			public void keyPressed(KeyEvent e) {
-				if (e.getKeyCode() != KeyEvent.VK_ENTER) {
-					return;
-				}
-				activatedAttributesTable();
-				e.consume();
-			}
-		});
+		elementsTablePanel.addCellActivationListener(elementActivationListener);
+		attributesTablePanel.addCellActivationListener(attributeActivationListener);
+
+		elementsTablePanel.addSeekListener(seekListener);
+		attributesTablePanel.addSeekListener(seekListener);
 	}
 
 	@Override
@@ -380,16 +344,6 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 				.withContext(DebuggerObjectActionContext.class)
 				.enabledWhen(this::hasSingleLink)
 				.onAction(this::activatedFollowLink)
-				.buildAndInstallLocal(this);
-
-		// TODO: These are a stopgap until the plot column header provides nav
-		actionStepBackward = StepSnapBackwardAction.builder(plugin)
-				.enabledWhen(this::isStepBackwardEnabled)
-				.onAction(this::activatedStepBackward)
-				.buildAndInstallLocal(this);
-		actionStepForward = StepSnapForwardAction.builder(plugin)
-				.enabledWhen(this::isStepForwardEnabled)
-				.onAction(this::activatedStepForward)
 				.buildAndInstallLocal(this);
 	}
 
@@ -468,44 +422,6 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 		setPath(values.get(0).getChild().getCanonicalPath(), null, EventOrigin.USER_GENERATED);
 	}
 
-	private boolean isStepBackwardEnabled(ActionContext ignored) {
-		if (current.getTrace() == null) {
-			return false;
-		}
-		if (!current.getTime().isSnapOnly()) {
-			return true;
-		}
-		if (current.getSnap() <= 0) {
-			return false;
-		}
-		return true;
-	}
-
-	private void activatedStepBackward(ActionContext ignored) {
-		if (current.getTime().isSnapOnly()) {
-			traceManager.activateSnap(current.getSnap() - 1);
-		}
-		else {
-			traceManager.activateSnap(current.getSnap());
-		}
-	}
-
-	private boolean isStepForwardEnabled(ActionContext ignored) {
-		Trace curTrace = current.getTrace();
-		if (curTrace == null) {
-			return false;
-		}
-		Long maxSnap = curTrace.getTimeManager().getMaxSnap();
-		if (maxSnap == null || current.getSnap() >= maxSnap) {
-			return false;
-		}
-		return true;
-	}
-
-	private void activatedStepForward(ActionContext ignored) {
-		traceManager.activateSnap(current.getSnap() + 1);
-	}
-
 	@Override
 	public JComponent getComponent() {
 		return mainPanel;
@@ -521,7 +437,7 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 			return null;
 		}
 		TraceObject parent = trace.getObjectManager().getObjectByCanonicalPath(parentPath);
-		// TODO: Require parent to be a canonical container?
+		// Should we require parent to be a canonical container?
 		if (parent == null) {
 			return null;
 		}
@@ -709,28 +625,6 @@ public class DebuggerModelProvider extends ComponentProvider implements Saveable
 
 	public boolean isShowMethodsInTree() {
 		return showMethodsInTree;
-	}
-
-	@AutoOptionConsumed(name = DebuggerResources.OPTION_NAME_COLORS_VALUE_CHANGED)
-	public void setDiffColor(Color diffColor) {
-		if (Objects.equals(this.diffColor, diffColor)) {
-			return;
-		}
-		this.diffColor = diffColor;
-		objectsTreePanel.setDiffColor(diffColor);
-		elementsTablePanel.setDiffColor(diffColor);
-		attributesTablePanel.setDiffColor(diffColor);
-	}
-
-	@AutoOptionConsumed(name = DebuggerResources.OPTION_NAME_COLORS_VALUE_CHANGED_SEL)
-	public void setDiffColorSel(Color diffColorSel) {
-		if (Objects.equals(this.diffColorSel, diffColorSel)) {
-			return;
-		}
-		this.diffColorSel = diffColorSel;
-		objectsTreePanel.setDiffColorSel(diffColorSel);
-		elementsTablePanel.setDiffColorSel(diffColorSel);
-		attributesTablePanel.setDiffColorSel(diffColorSel);
 	}
 
 	protected void setTreeSelection(TraceObjectKeyPath path, EventOrigin origin) {

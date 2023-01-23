@@ -16,11 +16,11 @@
 package ghidra.app.plugin.core.debug.gui.watch;
 
 import java.awt.*;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
+import java.awt.event.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.*;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -38,6 +38,7 @@ import docking.action.ToggleDockingAction;
 import docking.action.builder.ActionBuilder;
 import docking.widgets.table.*;
 import docking.widgets.table.DefaultEnumeratedColumnTableModel.EnumeratedTableColumn;
+import generic.theme.GColor;
 import ghidra.app.context.ListingActionContext;
 import ghidra.app.context.ProgramLocationActionContext;
 import ghidra.app.plugin.core.data.AbstractSettingsDialog;
@@ -47,6 +48,7 @@ import ghidra.app.plugin.core.debug.gui.DebuggerResources;
 import ghidra.app.plugin.core.debug.gui.DebuggerResources.*;
 import ghidra.app.plugin.core.debug.gui.register.DebuggerRegisterActionContext;
 import ghidra.app.plugin.core.debug.gui.register.RegisterRow;
+import ghidra.app.plugin.processors.sleigh.SleighLanguage;
 import ghidra.app.services.*;
 import ghidra.async.AsyncDebouncer;
 import ghidra.async.AsyncTimer;
@@ -55,13 +57,15 @@ import ghidra.docking.settings.*;
 import ghidra.framework.model.DomainObject;
 import ghidra.framework.model.DomainObjectChangeRecord;
 import ghidra.framework.options.SaveState;
-import ghidra.framework.options.annotation.AutoOptionDefined;
-import ghidra.framework.options.annotation.HelpInfo;
 import ghidra.framework.plugintool.*;
 import ghidra.framework.plugintool.annotation.AutoServiceConsumed;
+import ghidra.pcode.exec.DebuggerPcodeUtils;
+import ghidra.pcode.exec.DebuggerPcodeUtils.WatchValue;
+import ghidra.pcode.exec.PcodeExecutor;
 import ghidra.pcode.exec.trace.TraceSleighUtils;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.Symbol;
@@ -71,19 +75,31 @@ import ghidra.program.util.ProgramSelection;
 import ghidra.trace.model.*;
 import ghidra.trace.model.Trace.TraceMemoryBytesChangeType;
 import ghidra.trace.model.Trace.TraceMemoryStateChangeType;
+import ghidra.trace.model.guest.TracePlatform;
 import ghidra.trace.model.program.TraceProgramView;
 import ghidra.trace.model.time.schedule.TraceSchedule;
 import ghidra.trace.util.TraceAddressSpace;
-import ghidra.util.*;
+import ghidra.util.HelpLocation;
+import ghidra.util.Msg;
 import ghidra.util.database.UndoableTransaction;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.table.GhidraTable;
 import ghidra.util.table.GhidraTableFilterPanel;
 import ghidra.util.table.column.AbstractGColumnRenderer;
 
-public class DebuggerWatchesProvider extends ComponentProviderAdapter {
+public class DebuggerWatchesProvider extends ComponentProviderAdapter
+		implements DebuggerWatchesService {
 	private static final String KEY_ROW_COUNT = "rowCount";
 	private static final String PREFIX_ROW = "row";
+
+	private static final Color COLOR_FOREGROUND_STALE =
+		new GColor("color.debugger.plugin.resources.watch.stale");
+	private static final Color COLOR_FOREGROUND_STALE_SEL =
+		new GColor("color.debugger.plugin.resources.watch.stale.selected");
+	private static final Color COLOR_FOREGROUND_CHANGED =
+		new GColor("color.debugger.plugin.resources.watch.changed");
+	private static final Color COLOR_FOREGROUND_CHANGED_SEL =
+		new GColor("color.debugger.plugin.resources.watch.changed.selected");
 
 	interface WatchTypeSettings {
 		String NAME = DebuggerResources.NAME_WATCH_TYPE_SETTINGS;
@@ -209,7 +225,7 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 	}
 
 	protected static boolean sameCoordinates(DebuggerCoordinates a, DebuggerCoordinates b) {
-		if (!Objects.equals(a.getTrace(), b.getTrace())) {
+		if (!Objects.equals(a.getPlatform(), b.getPlatform())) {
 			return false;
 		}
 		if (!Objects.equals(a.getRecorder(), b.getRecorder())) {
@@ -278,18 +294,18 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 			WatchRow row = (WatchRow) data.getRowObject();
 			if (!row.isKnown()) {
 				if (data.isSelected()) {
-					setForeground(watchStaleSelColor);
+					setForeground(COLOR_FOREGROUND_STALE_SEL);
 				}
 				else {
-					setForeground(watchStaleColor);
+					setForeground(COLOR_FOREGROUND_STALE);
 				}
 			}
 			else if (row.isChanged()) {
 				if (data.isSelected()) {
-					setForeground(watchChangesSelColor);
+					setForeground(COLOR_FOREGROUND_CHANGED_SEL);
 				}
 				else {
-					setForeground(watchChangesColor);
+					setForeground(COLOR_FOREGROUND_CHANGED);
 				}
 			}
 			return this;
@@ -304,7 +320,18 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 	final DebuggerWatchesPlugin plugin;
 
 	DebuggerCoordinates current = DebuggerCoordinates.NOWHERE;
+	DebuggerCoordinates previous = DebuggerCoordinates.NOWHERE;
 	private Trace currentTrace; // Copy for transition
+	SleighLanguage language;
+	PcodeExecutor<WatchValue> asyncWatchExecutor; // name is reminder to use asynchronously
+	PcodeExecutor<byte[]> prevValueExecutor;
+	// TODO: We could do better, but the tests can't sync if we do multi-threaded evaluation
+	ExecutorService workQueue = Executors.newSingleThreadExecutor(new ThreadFactory() {
+		@Override
+		public Thread newThread(Runnable r) {
+			return new Thread(r, "Watch Evaluator");
+		}
+	});
 
 	@AutoServiceConsumed
 	private DebuggerListingService listingService; // For goto and selection
@@ -317,27 +344,6 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 	DebuggerStaticMappingService mappingService;
 	@SuppressWarnings("unused")
 	private final AutoService.Wiring autoServiceWiring;
-
-	@AutoOptionDefined(
-		name = DebuggerResources.OPTION_NAME_COLORS_WATCH_STALE, //
-		description = "Text color for watches whose value is not known", //
-		help = @HelpInfo(anchor = "colors"))
-	protected Color watchStaleColor = DebuggerResources.DEFAULT_COLOR_WATCH_STALE;
-	@AutoOptionDefined(
-		name = DebuggerResources.OPTION_NAME_COLORS_WATCH_STALE_SEL, //
-		description = "Selected text color for watches whose value is not known", //
-		help = @HelpInfo(anchor = "colors"))
-	protected Color watchStaleSelColor = DebuggerResources.DEFAULT_COLOR_WATCH_STALE_SEL;
-	@AutoOptionDefined(
-		name = DebuggerResources.OPTION_NAME_COLORS_WATCH_CHANGED, //
-		description = "Text color for watches whose value just changed", //
-		help = @HelpInfo(anchor = "colors"))
-	protected Color watchChangesColor = DebuggerResources.DEFAULT_COLOR_WATCH_CHANGED;
-	@AutoOptionDefined(
-		name = DebuggerResources.OPTION_NAME_COLORS_WATCH_CHANGED_SEL, //
-		description = "Selected text color for watches whose value just changed", //
-		help = @HelpInfo(anchor = "colors"))
-	protected Color watchChangesSelColor = DebuggerResources.DEFAULT_COLOR_WATCH_CHANGED_SEL;
 
 	private final AddressSet changed = new AddressSet();
 	private final AsyncDebouncer<Void> changeDebouncer =
@@ -408,10 +414,17 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 		watchTable.addMouseListener(new MouseAdapter() {
 			@Override
 			public void mouseClicked(MouseEvent e) {
-				if (e.getClickCount() != 2 || e.getButton() != MouseEvent.BUTTON1) {
-					return;
+				if (e.getClickCount() == 2 && e.getButton() == MouseEvent.BUTTON1) {
+					navigateToSelectedWatch();
 				}
-				navigateToSelectedWatch();
+			}
+		});
+		watchTable.addKeyListener(new KeyAdapter() {
+			@Override
+			public void keyPressed(KeyEvent e) {
+				if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+					navigateToSelectedWatch();
+				}
 			}
 		});
 
@@ -543,7 +556,7 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 
 	protected boolean selHasMemoryReads(DebuggerWatchActionContext ctx) {
 		for (WatchRow row : ctx.getWatchRows()) {
-			AddressSet set = row.getReads();
+			AddressSetView set = row.getReads();
 			if (set == null) {
 				continue;
 			}
@@ -634,7 +647,7 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 		}
 		AddressSet sel = new AddressSet();
 		for (WatchRow row : context.getWatchRows()) {
-			AddressSet reads = row.getReads();
+			AddressSetView reads = row.getReads();
 			if (reads != null) {
 				sel.add(reads);
 			}
@@ -790,12 +803,22 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 		watchRow.setDataType(regRow.getDataType());
 	}
 
+	@Override
 	public WatchRow addWatch(String expression) {
 		WatchRow row = new WatchRow(this, "");
-		row.setCoordinates(current);
 		watchTableModel.add(row);
 		row.setExpression(expression);
 		return row;
+	}
+
+	@Override
+	public void removeWatch(WatchRow row) {
+		watchTableModel.delete(row);
+	}
+
+	@Override
+	public synchronized List<WatchRow> getWatches() {
+		return List.copyOf(watchTableModel.getModelData());
 	}
 
 	@Override
@@ -831,47 +854,62 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 			current = coordinates;
 			return;
 		}
+		previous = current;
 		current = coordinates;
 
 		doSetTrace(current.getTrace());
 
-		setRowsContext(coordinates);
-
-		if (current.isAliveAndReadsPresent()) {
-			readTarget();
+		TracePlatform platform = current.getPlatform();
+		Language lang = platform == null ? null : platform.getLanguage();
+		if (lang instanceof SleighLanguage slang) {
+			language = slang;
 		}
+		else {
+			language = null;
+		}
+
+		asyncWatchExecutor = current.getPlatform() == null ? null
+				: DebuggerPcodeUtils.buildWatchExecutor(tool, current);
+		prevValueExecutor = current.getPlatform() == null || previous.getPlatform() == null ? null
+				: TraceSleighUtils.buildByteExecutor(previous.getPlatform(),
+					previous.getViewSnap(), previous.getThread(), previous.getFrame());
 		reevaluate();
-		Swing.runIfSwingOrRunLater(() -> watchTableModel.fireTableDataChanged());
 	}
 
-	public synchronized void setRowsContext(DebuggerCoordinates coordinates) {
-		for (WatchRow row : watchTableModel.getModelData()) {
-			row.setCoordinates(coordinates);
+	protected void clearCachedState() {
+		if (asyncWatchExecutor != null) {
+			asyncWatchExecutor.getState().clear();
 		}
-	}
-
-	public synchronized void readTarget() {
-		for (WatchRow row : watchTableModel.getModelData()) {
-			row.doTargetReads();
+		if (prevValueExecutor != null) {
+			prevValueExecutor.getState().clear();
 		}
 	}
 
 	public synchronized void doCheckDepsAndReevaluate() {
+		if (asyncWatchExecutor == null) {
+			return;
+		}
+		List<WatchRow> toReevaluate = new ArrayList<>();
 		for (WatchRow row : watchTableModel.getModelData()) {
-			AddressSet reads = row.getReads();
+			AddressSetView reads = row.getReads();
 			if (reads == null || reads.intersects(changed)) {
-				row.doTargetReads();
+				toReevaluate.add(row);
+			}
+		}
+		if (!toReevaluate.isEmpty()) {
+			clearCachedState();
+			for (WatchRow row : toReevaluate) {
 				row.reevaluate();
 			}
 		}
 		changed.clear();
-		Swing.runIfSwingOrRunLater(() -> {
-			watchTableModel.fireTableDataChanged();
-			contextChanged();
-		});
 	}
 
 	public void reevaluate() {
+		if (asyncWatchExecutor == null) {
+			return;
+		}
+		clearCachedState();
 		for (WatchRow row : watchTableModel.getModelData()) {
 			row.reevaluate();
 		}
@@ -913,5 +951,15 @@ public class DebuggerWatchesProvider extends ComponentProviderAdapter {
 
 	public void goToTime(TraceSchedule time) {
 		traceManager.activateTime(time);
+	}
+
+	public void waitEvaluate(int timeoutMs) {
+		try {
+			CompletableFuture.runAsync(() -> {
+			}, workQueue).get(timeoutMs, TimeUnit.MILLISECONDS);
+		}
+		catch (ExecutionException | InterruptedException | TimeoutException e) {
+			throw new AssertionError(e);
+		}
 	}
 }

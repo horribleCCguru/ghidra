@@ -15,11 +15,10 @@
  */
 package ghidra.app.util.opinion;
 
-import java.util.ArrayList;
-import java.util.List;
-
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 import ghidra.app.plugin.processors.generic.MemoryBlockDefinition;
 import ghidra.app.util.Option;
@@ -27,8 +26,7 @@ import ghidra.app.util.OptionUtils;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.formats.gfilesystem.FSRL;
-import ghidra.framework.model.DomainFolder;
-import ghidra.framework.model.DomainObject;
+import ghidra.framework.model.*;
 import ghidra.framework.store.LockException;
 import ghidra.plugin.importer.ProgramMappingService;
 import ghidra.program.database.ProgramDB;
@@ -39,7 +37,6 @@ import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.InvalidAddressException;
 import ghidra.program.model.mem.MemoryConflictException;
 import ghidra.program.model.symbol.*;
-import ghidra.program.model.util.AddressLabelInfo;
 import ghidra.program.util.DefaultLanguageService;
 import ghidra.program.util.GhidraProgramUtilities;
 import ghidra.util.*;
@@ -59,6 +56,14 @@ public abstract class AbstractProgramLoader implements Loader {
 	public static final String ANCHOR_LABELS_OPTION_NAME = "Anchor Processor Defined Labels";
 
 	/**
+	 * A {@link Program} with its associated {@link DomainFolder destination folder}
+	 * 
+	 * @param program The {@link Program}
+	 * @param destinationFolder The {@link DomainFolder} where the program will get loaded to
+	 */
+	public record LoadedProgram(Program program, DomainFolder destinationFolder) {/**/}
+
+	/**
 	 * Loads program bytes in a particular format as a new {@link Program}. Multiple
 	 * {@link Program}s may end up getting created, depending on the nature of the format.
 	 *
@@ -71,12 +76,12 @@ public abstract class AbstractProgramLoader implements Loader {
 	 * @param log The message log.
 	 * @param consumer A consumer object for {@link Program}s generated.
 	 * @param monitor A cancelable task monitor.
-	 * @return A list of loaded {@link Program}s (element 0 corresponds to primary loaded
-	 *   {@link Program}).
+	 * @return A list of {@link LoadedProgram loaded programs} (element 0 corresponds to primary 
+	 *   loaded {@link Program}).
 	 * @throws IOException if there was an IO-related problem loading.
 	 * @throws CancelledException if the user cancelled the load.
 	 */
-	protected abstract List<Program> loadProgram(ByteProvider provider, String programName,
+	protected abstract List<LoadedProgram> loadProgram(ByteProvider provider, String programName,
 			DomainFolder programFolder, LoadSpec loadSpec, List<Option> options, MessageLog log,
 			Object consumer, TaskMonitor monitor) throws IOException, CancelledException;
 
@@ -106,60 +111,78 @@ public abstract class AbstractProgramLoader implements Loader {
 			TaskMonitor monitor) throws IOException, CancelledException, InvalidNameException,
 			DuplicateNameException, VersionException {
 
+		if (!isOverrideMainProgramName()) {
+			folder = ProjectDataUtils.createDomainFolderPath(folder, name);
+		}
+
 		List<DomainObject> results = new ArrayList<>();
 
 		if (!loadSpec.isComplete()) {
 			return results;
 		}
 
-		List<Program> programs =
+		List<LoadedProgram> loadedPrograms =
 			loadProgram(provider, name, folder, loadSpec, options, messageLog, consumer, monitor);
 
 		boolean success = false;
 		try {
 			monitor.checkCanceled();
-			List<Program> programsToFixup = new ArrayList<>();
-			for (Program loadedProgram : programs) {
+			for (LoadedProgram loadedProgram : loadedPrograms) {
 				monitor.checkCanceled();
 
-				applyProcessorLabels(options, loadedProgram);
+				Program program = loadedProgram.program();
 
-				loadedProgram.setEventsEnabled(true);
+				applyProcessorLabels(options, program);
+
+				program.setEventsEnabled(true);
 
 				// TODO: null should not be used as a determinant for saving; don't allow null
 				// folders?
-				if (folder == null) {
-					results.add(loadedProgram);
+				if (loadedProgram.destinationFolder() == null) {
+					results.add(program);
 					continue;
 				}
 
-				// If this is the main imported program, use the given name, otherwise, use the
-				// internal program name. The first program in the list is the main imported program
-				String domainFileName =
-					loadedProgram == programs.get(0) ? name : loadedProgram.getName();
+				String domainFileName = program.getName();
+				if (isOverrideMainProgramName()) {
+					// If this is the main imported program, use the given name, otherwise, use the
+					// internal program name. The first program in the list is the main imported program
+					if (program == loadedPrograms.get(0).program()) {
+						domainFileName = name;
+					}
+				}
 
-				if (createProgramFile(loadedProgram, folder, domainFileName, messageLog,
-					monitor)) {
-					results.add(loadedProgram);
-					programsToFixup.add(loadedProgram);
+				if (createProgramFile(program, loadedProgram.destinationFolder(), domainFileName,
+					messageLog, monitor)) {
+					results.add(program);
 				}
 				else {
-					loadedProgram.release(consumer); // some kind of exception happened; see MessageLog
+					program.release(consumer); // some kind of exception happened; see MessageLog
 				}
 			}
 
 			// Subclasses can perform custom post-load fix-ups
-			postLoadProgramFixups(programsToFixup, folder, options, messageLog, monitor);
+			postLoadProgramFixups(loadedPrograms, options, messageLog, monitor);
 
 			success = true;
 		}
 		finally {
 			if (!success) {
-				release(programs, consumer);
+				release(loadedPrograms, consumer);
 			}
 		}
 
 		return results;
+	}
+
+	/**
+	 * Some loaders can return more than one program.
+	 * This method indicates whether the first (or main) program's name 
+	 * should be overridden and changed to the imported file name.
+	 * @return true if first program name should be changed
+	 */
+	protected boolean isOverrideMainProgramName() {
+		return true;
 	}
 
 	@Override
@@ -214,20 +237,18 @@ public abstract class AbstractProgramLoader implements Loader {
 	}
 
 	/**
-	 * This gets called after the given list of {@link Program}s is finished loading.  It provides
-	 * subclasses an opportunity to do follow-on actions to the load.
+	 * This gets called after the given list of {@link LoadedProgram programs}s is finished loading.
+	 * It provides subclasses an opportunity to do follow-on actions to the load.
 	 *
-	 * @param loadedPrograms The {@link Program}s that got loaded.
-	 * @param folder The folder the programs were loaded to.
+	 * @param loadedPrograms The {@link LoadedProgram programs} that got loaded.
 	 * @param options The load options.
 	 * @param messageLog The message log.
 	 * @param monitor A cancelable task monitor.
 	 * @throws IOException if there was an IO-related problem loading.
 	 * @throws CancelledException if the user cancelled the load.
 	 */
-	protected void postLoadProgramFixups(List<Program> loadedPrograms, DomainFolder folder,
-			List<Option> options, MessageLog messageLog, TaskMonitor monitor)
-			throws CancelledException, IOException {
+	protected void postLoadProgramFixups(List<LoadedProgram> loadedPrograms, List<Option> options,
+			MessageLog messageLog, TaskMonitor monitor) throws CancelledException, IOException {
 		// Default behavior is to do nothing.
 	}
 
@@ -432,14 +453,14 @@ public abstract class AbstractProgramLoader implements Loader {
 	}
 
 	/**
-	 * Releases the given consumer from each of the provided {@link DomainObject}s.
+	 * Releases the given consumer from each of the provided {@link LoadedProgram}s.
 	 *
-	 * @param domainObjects A list of {@link DomainObject}s which are no longer being used.
+	 * @param loadedPrograms A list of {@link LoadedProgram}s which are no longer being used.
 	 * @param consumer The consumer that was marking the {@link DomainObject}s as being used.
 	 */
-	protected final void release(List<? extends DomainObject> domainObjects, Object consumer) {
-		for (DomainObject dobj : domainObjects) {
-			dobj.release(consumer);
+	protected final void release(List<LoadedProgram> loadedPrograms, Object consumer) {
+		for (LoadedProgram loadedProgram : loadedPrograms) {
+			loadedProgram.program().release(consumer);
 		}
 	}
 
@@ -497,9 +518,7 @@ public abstract class AbstractProgramLoader implements Loader {
 			for (Register reg : lang.getRegisters()) {
 				Address addr = reg.getAddress();
 				if (addr.isMemoryAddress()) {
-					AddressLabelInfo info = new AddressLabelInfo(addr, reg.getName(),
-						reg.isBaseRegister(), SourceType.IMPORTED);
-					createSymbol(program, info, true);
+					createSymbol(program, reg.getName(), addr, false, true, true);
 				}
 			}
 			// optionally create default symbols defined by pspec
@@ -507,7 +526,7 @@ public abstract class AbstractProgramLoader implements Loader {
 				boolean anchorSymbols = shouldAnchorSymbols(options);
 				List<AddressLabelInfo> labels = lang.getDefaultSymbols();
 				for (AddressLabelInfo info : labels) {
-					createSymbol(program, info, anchorSymbols);
+					createSymbol(program, info.getLabel(), info.getAddress(), info.isEntry(), info.isPrimary(), anchorSymbols);
 				}
 			}
 			GhidraProgramUtilities.removeAnalyzedFlag(program);
@@ -517,42 +536,24 @@ public abstract class AbstractProgramLoader implements Loader {
 		}
 	}
 
-	private void createSymbol(Program program, AddressLabelInfo info, boolean anchorSymbols) {
+	private static void createSymbol(Program program, String labelname, Address address, boolean isEntry, boolean isPrimary, boolean anchorSymbols) {
 		SymbolTable symTable = program.getSymbolTable();
-		Address addr = info.getAddress();
+		Address addr = address;
 		Symbol s = symTable.getPrimarySymbol(addr);
 		try {
-			if (s == null || s.getSource() == SourceType.IMPORTED) {
-				Namespace namespace = program.getGlobalNamespace();
-				if (info.getScope() != null) {
-					namespace = info.getScope();
-				}
-				s = symTable.createLabel(addr, info.getLabel(), namespace, info.getSource());
-				if (info.isEntry()) {
-					symTable.addExternalEntryPoint(addr);
-				}
-				if (info.isPrimary()) {
-					s.setPrimary();
-				}
-				if (anchorSymbols) {
-					s.setPinned(true);
-				}
+			Namespace namespace = program.getGlobalNamespace();
+			s = symTable.createLabel(addr, labelname, namespace, SourceType.IMPORTED);
+			if (isEntry) {
+				symTable.addExternalEntryPoint(addr);
 			}
-			else if (s.getSource() == SourceType.DEFAULT) {
-				String labelName = info.getLabel();
-				if (s.getSymbolType() == SymbolType.FUNCTION) {
-					Function f = (Function) s.getObject();
-					f.setName(labelName, SourceType.IMPORTED);
-				}
-				else {
-					s.setName(labelName, SourceType.IMPORTED);
-				}
-				if (anchorSymbols) {
-					s.setPinned(true);
-				}
+			if (isPrimary) {
+				s.setPrimary();
+			}
+			if (anchorSymbols) {
+				s.setPinned(true);
 			}
 		}
-		catch (DuplicateNameException | InvalidInputException e) {
+		catch (InvalidInputException e) {
 			// Nothing to do
 		}
 	}

@@ -16,6 +16,10 @@
 #include <iostream>
 #include <cstdlib>
 
+using std::cin;
+using std::cout;
+using std::cerr;
+
 #include "libdecomp.hh"
 
 class IfcLoadFile : public IfaceDecompCommand {
@@ -214,7 +218,6 @@ int main(int argc,char **argv)
 
   if (initscript != (const char *)0) {
     try {
-      status->setErrorIsDone(true);
       status->pushScript(initscript,"init> ");
     } catch(IfaceParseError &err) {
       *status->optr << err.explain << endl;

@@ -30,6 +30,30 @@ import ghidra.trace.model.Trace;
 import ghidra.trace.model.breakpoint.TraceBreakpoint;
 import ghidra.trace.model.breakpoint.TraceBreakpointKind;
 
+/**
+ * A logical breakpoint
+ *
+ * <p>
+ * This is a collection of at most one program breakpoint, which is actually a bookmark with a
+ * special type, and any number of trace breakpoints. The program breakpoint represents the logical
+ * breakpoint, as this is the most stable anchor for keeping the user's breakpoint set. All
+ * breakpoints in the set correspond to the same address when considering the module map (or other
+ * source of static-to-dynamic mapping), which may involve relocation. They also share the same
+ * kinds and length, since these are more or less intrinsic to the breakpoints specification. Thus,
+ * more than one logical breakpoint may occupy the same address. A logical breakpoints having a
+ * program bookmark (or that at least has a static address) is called a "mapped" breakpoint. This is
+ * the ideal, ordinary case. A breakpoint that cannot be mapped to a static address (and thus cannot
+ * have a program bookmark) is called a "lone" breakpoint.
+ * 
+ * <p>
+ * <b>WARNING:</b> The lifecycle of a logical breakpoint is fairly volatile. It is generally not
+ * safe to "hold onto" a logical breakpoint, since with any event, the logical breakpoint service
+ * may discard and re-create the object, even if it's composed of the same program and trace
+ * breakpoints. If it is truly necessary to hold onto logical breakpoints, consider using
+ * {@link DebuggerLogicalBreakpointService#addChangeListener(LogicalBreakpointsChangeListener)}. A
+ * logical breakpoint is valid until the service invokes
+ * {@link LogicalBreakpointsChangeListener#breakpointRemoved(LogicalBreakpoint)}.
+ */
 public interface LogicalBreakpoint {
 	String BREAKPOINT_ENABLED_BOOKMARK_TYPE = "BreakpointEnabled";
 	String BREAKPOINT_DISABLED_BOOKMARK_TYPE = "BreakpointDisabled";
@@ -606,6 +630,22 @@ public interface LogicalBreakpoint {
 	void setName(String name);
 
 	/**
+	 * Get the sleigh injection when emulating this breakpoint
+	 * 
+	 * @return the sleigh injection
+	 * @see TraceBreakpoint#getEmuSleigh()
+	 */
+	String getEmuSleigh();
+
+	/**
+	 * Set the sleigh injection when emulating this breakpoint
+	 * 
+	 * @param sleigh the sleigh injection
+	 * @see TraceBreakpoint#setEmuSleigh(String)
+	 */
+	void setEmuSleigh(String sleigh);
+
+	/**
 	 * If the logical breakpoint has a mapped program location, get that location.
 	 * 
 	 * @return the location if mapped, or {@code null}
@@ -789,6 +829,18 @@ public interface LogicalBreakpoint {
 	 * @return a future which completes when the breakpoint is deleted
 	 */
 	CompletableFuture<Void> deleteForTrace(Trace trace);
+
+	/**
+	 * Generate a status message for enabling this breakpoint
+	 * 
+	 * <p>
+	 * If this breakpoint has no locations in the given trace, then the status message should
+	 * explain that it cannot actually enable the breakpoint.
+	 * 
+	 * @param trace optional to limit scope of message to locations in the given trace
+	 * @return the status message, or null
+	 */
+	String generateStatusEnable(Trace trace);
 
 	/**
 	 * Enable (or create) this breakpoint everywhere in the tool.

@@ -22,7 +22,9 @@ import ghidra.app.emulator.Emulator;
 import ghidra.app.plugin.processors.sleigh.SleighLanguage;
 import ghidra.pcode.exec.*;
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
+import ghidra.pcode.exec.PcodeExecutorStatePiece.Reason;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.lang.*;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.pcode.PcodeOp;
@@ -33,10 +35,10 @@ import ghidra.util.Msg;
  * The default implementation of {@link PcodeThread} suitable for most applications
  * 
  * <p>
- * When emulating on concrete state, consider using {@link ModifiedPcodeThread}, so that
- * state modifiers from the older {@link Emulator} are incorporated. In either case, it may be
- * worthwhile to examine existing state modifiers to ensure they are appropriately represented in
- * any abstract state. It may be necessary to port them.
+ * When emulating on concrete state, consider using {@link ModifiedPcodeThread}, so that state
+ * modifiers from the older {@link Emulator} are incorporated. In either case, it may be worthwhile
+ * to examine existing state modifiers to ensure they are appropriately represented in any abstract
+ * state. It may be necessary to port them.
  * 
  * <p>
  * This class implements the control-flow logic of the target machine, cooperating with the p-code
@@ -119,7 +121,21 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 		 */
 		@PcodeUserop
 		public void emu_swi() {
-			throw new InterruptPcodeExecutionException(null, null);
+			thread.swi();
+		}
+
+		/**
+		 * Notify the client of a failed Sleigh inject compilation.
+		 * 
+		 * <p>
+		 * To avoid pestering the client during emulator set-up, a service may effectively defer
+		 * notifying the user of Sleigh compilation errors by replacing the erroneous injects with
+		 * calls to this p-code op. Then, only if and when an erroneous inject is encountered will
+		 * the client be notified.
+		 */
+		@PcodeUserop
+		public void emu_injection_err() {
+			throw new InjectionErrorPcodeExecutionException(null, null);
 		}
 	}
 
@@ -143,28 +159,39 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 		 * @param state the composite state assigned to the thread
 		 */
 		public PcodeThreadExecutor(DefaultPcodeThread<T> thread) {
-			super(thread.language, thread.arithmetic, thread.state);
+			super(thread.language, thread.arithmetic, thread.state, Reason.EXECUTE);
 			this.thread = thread;
 		}
 
 		@Override
-		public void executeSleighLine(String line) {
-			PcodeProgram program = SleighProgramCompiler.compileProgram(language, "line",
-				List.of(line + ";"), thread.library);
+		public void executeSleigh(String source) {
+			PcodeProgram program =
+				SleighProgramCompiler.compileProgram(language, "exec", source, thread.library);
 			execute(program, thread.library);
 		}
 
 		@Override
 		public void stepOp(PcodeOp op, PcodeFrame frame, PcodeUseropLibrary<T> library) {
-			if (suspended) {
+			if (suspended || thread.machine.suspended) {
 				throw new SuspendedPcodeExecutionException(frame, null);
 			}
 			super.stepOp(op, frame, library);
+			thread.stepped();
+		}
+
+		@Override
+		protected void checkLoad(AddressSpace space, T offset, int size) {
+			thread.checkLoad(space, offset, size);
+		}
+
+		@Override
+		protected void checkStore(AddressSpace space, T offset, int size) {
+			thread.checkStore(space, offset, size);
 		}
 
 		@Override
 		protected void branchToAddress(Address target) {
-			thread.overrideCounter(target);
+			thread.branchToAddress(target);
 		}
 
 		@Override
@@ -225,7 +252,8 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 		this.library = createUseropLibrary();
 
 		this.executor = createExecutor();
-		this.pc = language.getProgramCounter();
+		this.pc =
+			Objects.requireNonNull(language.getProgramCounter(), "Language has no program counter");
 		this.contextreg = language.getContextBaseRegister();
 
 		if (contextreg != Register.NO_CONTEXT) {
@@ -291,6 +319,11 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 		return counter;
 	}
 
+	protected void branchToAddress(Address target) {
+		overrideCounter(target);
+		decoder.branched(counter);
+	}
+
 	@Override
 	public void overrideCounter(Address counter) {
 		setCounter(counter);
@@ -339,12 +372,13 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 
 	@Override
 	public void reInitialize() {
-		long offset = arithmetic.toLong(state.getVar(pc), Purpose.BRANCH);
+		long offset = arithmetic.toLong(state.getVar(pc, executor.getReason()), Purpose.BRANCH);
 		setCounter(language.getDefaultSpace().getAddress(offset, true));
 
 		if (contextreg != Register.NO_CONTEXT) {
 			try {
-				BigInteger ctx = arithmetic.toBigInteger(state.getVar(contextreg), Purpose.CONTEXT);
+				BigInteger ctx = arithmetic.toBigInteger(state.getVar(
+					contextreg, executor.getReason()), Purpose.CONTEXT);
 				assignContext(new RegisterValue(contextreg, ctx));
 			}
 			catch (AccessPcodeExecutionException e) {
@@ -427,7 +461,7 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 			overrideCounter(counter.addWrap(decoder.getLastLengthWithDelays()));
 		}
 		if (contextreg != Register.NO_CONTEXT) {
-			overrideContext(instruction.getRegisterValue(contextreg));
+			overrideContext(defaultContext.getFlowValue(instruction.getRegisterValue(contextreg)));
 		}
 		postExecuteInstruction();
 		frame = null;
@@ -588,9 +622,9 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 	}
 
 	@Override
-	public void inject(Address address, List<String> sleigh) {
+	public void inject(Address address, String source) {
 		PcodeProgram pcode = SleighProgramCompiler.compileProgram(
-			language, "thread_inject:" + address, sleigh, library);
+			language, "thread_inject:" + address, source, library);
 		injects.put(address, pcode);
 	}
 
@@ -602,5 +636,48 @@ public class DefaultPcodeThread<T> implements PcodeThread<T> {
 	@Override
 	public void clearAllInjects() {
 		injects.clear();
+	}
+
+	/**
+	 * Perform checks on a requested LOAD
+	 * 
+	 * <p>
+	 * Throw an exception if the LOAD should cause an interrupt.
+	 * 
+	 * @param space the address space being accessed
+	 * @param offset the offset being accessed
+	 * @param size the size of the variable being accessed
+	 */
+	protected void checkLoad(AddressSpace space, T offset, int size) {
+		machine.checkLoad(space, offset, size);
+	}
+
+	/**
+	 * Perform checks on a requested STORE
+	 * 
+	 * <p>
+	 * Throw an exception if the STORE should cause an interrupt.
+	 * 
+	 * @param space the address space being accessed
+	 * @param offset the offset being accessed
+	 * @param size the size of the variable being accessed
+	 */
+	protected void checkStore(AddressSpace space, T offset, int size) {
+		machine.checkStore(space, offset, size);
+	}
+
+	/**
+	 * Throw a software interrupt exception if those interrupts are active
+	 */
+	protected void swi() {
+		machine.swi();
+	}
+
+	/**
+	 * Notify the machine a thread has been stepped, so that it may re-enable software interrupts,
+	 * if applicable
+	 */
+	protected void stepped() {
+		machine.stepped();
 	}
 }

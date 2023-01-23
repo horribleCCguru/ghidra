@@ -92,8 +92,8 @@ public class TestDebuggerObjectModel extends EmptyDebuggerObjectModel {
 	}
 
 	protected TestTargetBreakpoint newTestTargetBreakpoint(TestTargetBreakpointContainer container,
-			int num, Address address, int length, Set<TargetBreakpointKind> kinds) {
-		return new TestTargetBreakpoint(container, num, address, length, kinds);
+			int num, AddressRange range, Set<TargetBreakpointKind> kinds) {
+		return new TestTargetBreakpoint(container, num, range, kinds);
 	}
 
 	protected TestTargetMemory newTestTargetMemory(TestTargetProcess process, AddressSpace space) {
@@ -154,6 +154,11 @@ public class TestDebuggerObjectModel extends EmptyDebuggerObjectModel {
 	protected TestTargetRegister newTestTargetRegister(TestTargetRegisterContainer container,
 			Register register) {
 		return TestTargetRegister.fromLanguageRegister(container, register);
+	}
+
+	protected TestTargetRegister newTestTargetRegister(TestTargetRegisterContainer container,
+			String index, Register register) {
+		return TestTargetRegister.fromLanguageRegister(container, index, register);
 	}
 
 	protected TestTargetThreadContainer newTestTargetThreadContainer(TestTargetProcess process) {

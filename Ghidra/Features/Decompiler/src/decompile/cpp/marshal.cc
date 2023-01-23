@@ -857,6 +857,11 @@ AddrSpace *PackedDecode::readSpace(const AttributeId &attribId)
   return res;
 }
 
+/// The value is either an unsigned integer, an address space index, or (the absolute value of) a signed integer.
+/// A type header is passed in with the particular type code for the value already filled in.
+/// This method then fills in the length code, outputs the full type header and the encoded bytes of the integer.
+/// \param typeByte is the type header
+/// \param val is the integer value
 void PackedEncode::writeInteger(uint1 typeByte,uint8 val)
 
 {
@@ -1031,7 +1036,7 @@ AttributeId ATTRIB_VAL = AttributeId("val",24);
 AttributeId ATTRIB_VALUE = AttributeId("value",25);
 AttributeId ATTRIB_WORDSIZE = AttributeId("wordsize",26);
 
-AttributeId ATTRIB_UNKNOWN = AttributeId("XMLunknown",148); // Number serves as next open index
+AttributeId ATTRIB_UNKNOWN = AttributeId("XMLunknown",149); // Number serves as next open index
 
 ElementId ELEM_DATA = ElementId("data",1);
 ElementId ELEM_INPUT = ElementId("input",2);

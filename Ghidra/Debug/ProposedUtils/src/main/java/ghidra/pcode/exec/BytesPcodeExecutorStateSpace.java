@@ -17,10 +17,10 @@ package ghidra.pcode.exec;
 
 import java.util.*;
 
-import com.google.common.collect.*;
-import com.google.common.primitives.UnsignedLong;
-
+import generic.ULongSpan;
+import generic.ULongSpan.ULongSpanSet;
 import ghidra.generic.util.datastruct.SemisparseByteArray;
+import ghidra.pcode.exec.PcodeExecutorStatePiece.Reason;
 import ghidra.program.model.address.*;
 import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
@@ -32,7 +32,7 @@ import ghidra.util.Msg;
  * @param <B> if this space is a cache, the type of object backing this space
  */
 public class BytesPcodeExecutorStateSpace<B> {
-	protected final SemisparseByteArray bytes = new SemisparseByteArray();
+	protected final SemisparseByteArray bytes;
 	protected final Language language; // for logging diagnostics
 	protected final AddressSpace space;
 	protected final B backing;
@@ -48,6 +48,19 @@ public class BytesPcodeExecutorStateSpace<B> {
 		this.language = language;
 		this.space = space;
 		this.backing = backing;
+		this.bytes = new SemisparseByteArray();
+	}
+
+	protected BytesPcodeExecutorStateSpace(Language language, AddressSpace space, B backing,
+			SemisparseByteArray bytes) {
+		this.language = language;
+		this.space = space;
+		this.backing = backing;
+		this.bytes = bytes;
+	}
+
+	public BytesPcodeExecutorStateSpace<B> fork() {
+		return new BytesPcodeExecutorStateSpace<>(language, space, backing, bytes.fork());
 	}
 
 	/**
@@ -61,35 +74,11 @@ public class BytesPcodeExecutorStateSpace<B> {
 	}
 
 	/**
-	 * Utility for handling uninitialized ranges: Get the lower endpoint
-	 * 
-	 * @param rng the range
-	 * @return the lower endpoint
-	 */
-	public long lower(Range<UnsignedLong> rng) {
-		return rng.lowerBoundType() == BoundType.CLOSED
-				? rng.lowerEndpoint().longValue()
-				: rng.lowerEndpoint().longValue() + 1;
-	}
-
-	/**
-	 * Utility for handling uninitialized ranges: Get the upper endpoint
-	 * 
-	 * @param rng the range
-	 * @return the upper endpoint
-	 */
-	public long upper(Range<UnsignedLong> rng) {
-		return rng.upperBoundType() == BoundType.CLOSED
-				? rng.upperEndpoint().longValue()
-				: rng.upperEndpoint().longValue() - 1;
-	}
-
-	/**
 	 * Extension point: Read from backing into this space, when acting as a cache.
 	 * 
 	 * @param uninitialized the ranges which need to be read.
 	 */
-	protected void readUninitializedFromBacking(RangeSet<UnsignedLong> uninitialized) {
+	protected void readUninitializedFromBacking(ULongSpanSet uninitialized) {
 	}
 
 	/**
@@ -99,27 +88,27 @@ public class BytesPcodeExecutorStateSpace<B> {
 	 * @param size the number of bytes to read (the size of the value)
 	 * @return the bytes read
 	 */
-	protected byte[] readBytes(long offset, int size) {
+	protected byte[] readBytes(long offset, int size, Reason reason) {
 		byte[] data = new byte[size];
 		bytes.getData(offset, data);
 		return data;
 	}
 
-	protected AddressRange addrRng(Range<UnsignedLong> rng) {
-		Address start = space.getAddress(lower(rng));
-		Address end = space.getAddress(upper(rng));
+	protected AddressRange addrRng(ULongSpan span) {
+		Address start = space.getAddress(span.min());
+		Address end = space.getAddress(span.max());
 		return new AddressRangeImpl(start, end);
 	}
 
-	protected AddressSet addrSet(RangeSet<UnsignedLong> set) {
+	protected AddressSet addrSet(ULongSpanSet set) {
 		AddressSet result = new AddressSet();
-		for (Range<UnsignedLong> rng : set.asRanges()) {
-			result.add(addrRng(rng));
+		for (ULongSpan span : set.spans()) {
+			result.add(addrRng(span));
 		}
 		return result;
 	}
 
-	protected Set<Register> getRegs(AddressSet set) {
+	protected Set<Register> getRegs(AddressSetView set) {
 		Set<Register> regs = new TreeSet<>();
 		for (AddressRange rng : set) {
 			Register r = language.getRegister(rng.getMinAddress(), (int) rng.getLength());
@@ -133,7 +122,7 @@ public class BytesPcodeExecutorStateSpace<B> {
 		return regs;
 	}
 
-	protected void warnAddressSet(String message, AddressSet set) {
+	protected void warnAddressSet(String message, AddressSetView set) {
 		Set<Register> regs = getRegs(set);
 		if (regs.isEmpty()) {
 			Msg.warn(this, message + ": " + set);
@@ -143,7 +132,7 @@ public class BytesPcodeExecutorStateSpace<B> {
 		}
 	}
 
-	protected void warnUninit(RangeSet<UnsignedLong> uninit) {
+	protected void warnUninit(ULongSpanSet uninit) {
 		AddressSet uninitialized = addrSet(uninit);
 		warnAddressSet("Emulator read from uninitialized state", uninitialized);
 	}
@@ -158,16 +147,36 @@ public class BytesPcodeExecutorStateSpace<B> {
 	 * 
 	 * @param offset the offset
 	 * @param size the number of bytes to read (the size of the value)
+	 * @param reason the reason for reading state
 	 * @return the bytes read
 	 */
-	public byte[] read(long offset, int size) {
+	public byte[] read(long offset, int size, Reason reason) {
 		if (backing != null) {
 			readUninitializedFromBacking(bytes.getUninitialized(offset, offset + size - 1));
 		}
-		RangeSet<UnsignedLong> stillUninit = bytes.getUninitialized(offset, offset + size - 1);
-		if (!stillUninit.isEmpty()) {
+		ULongSpanSet stillUninit = bytes.getUninitialized(offset, offset + size - 1);
+		if (!stillUninit.isEmpty() && reason == Reason.EXECUTE) {
 			warnUninit(stillUninit);
 		}
-		return readBytes(offset, size);
+		return readBytes(offset, size, reason);
+	}
+
+	public Map<Register, byte[]> getRegisterValues(List<Register> registers) {
+		Map<Register, byte[]> result = new HashMap<>();
+		for (Register reg : registers) {
+			long min = reg.getAddress().getOffset();
+			long max = min + reg.getNumBytes();
+			if (!bytes.isInitialized(min, max)) {
+				continue;
+			}
+			byte[] data = new byte[reg.getNumBytes()];
+			bytes.getData(min, data);
+			result.put(reg, data);
+		}
+		return result;
+	}
+
+	public void clear() {
+		bytes.clear();
 	}
 }

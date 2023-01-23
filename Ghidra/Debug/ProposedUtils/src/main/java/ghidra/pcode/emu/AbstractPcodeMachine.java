@@ -20,7 +20,7 @@ import java.util.*;
 import ghidra.app.plugin.processors.sleigh.SleighLanguage;
 import ghidra.pcode.exec.*;
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
-import ghidra.program.model.address.Address;
+import ghidra.program.model.address.*;
 import ghidra.program.model.lang.Language;
 import ghidra.util.classfinder.ClassSearcher;
 
@@ -64,13 +64,18 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 
 	protected final PcodeUseropLibrary<T> stubLibrary;
 
+	protected SwiMode swiMode = SwiMode.ACTIVE;
+
 	/* for abstract thread access */ PcodeStateInitializer initializer;
 	private PcodeExecutorState<T> sharedState;
 	protected final Map<String, PcodeThread<T>> threads = new LinkedHashMap<>();
 	protected final Collection<PcodeThread<T>> threadsView =
 		Collections.unmodifiableCollection(threads.values());
 
+	protected volatile boolean suspended = false;
 	protected final Map<Address, PcodeProgram> injects = new HashMap<>();
+	protected final SparseAddressRangeMap<AccessKind> accessBreakpoints =
+		new SparseAddressRangeMap<>();
 
 	/**
 	 * Construct a p-code machine with the given language and arithmetic
@@ -142,12 +147,12 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 	protected abstract PcodeExecutorState<T> createLocalState(PcodeThread<T> thread);
 
 	/**
-	 * A factory method to create a stub library for compiling thread-local SLEIGH source
+	 * A factory method to create a stub library for compiling thread-local Sleigh source
 	 * 
 	 * <p>
 	 * Because threads may introduce p-code userops using libraries unique to that thread, it
 	 * becomes necessary to at least export stub symbols, so that p-code programs can be compiled
-	 * from SLEIGH source before the thread has necessarily been created. A side effect of this
+	 * from Sleigh source before the thread has necessarily been created. A side effect of this
 	 * strategy is that all threads, though they may have independent libraries, must export
 	 * identically-named symbols.
 	 * 
@@ -155,6 +160,16 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 	 */
 	protected PcodeUseropLibrary<T> createThreadStubLibrary() {
 		return new DefaultPcodeThread.PcodeEmulationLibrary<T>(null);
+	}
+
+	@Override
+	public void setSoftwareInterruptMode(SwiMode mode) {
+		this.swiMode = mode;
+	}
+
+	@Override
+	public SwiMode getSoftwareInterruptMode() {
+		return swiMode;
 	}
 
 	/**
@@ -246,6 +261,11 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 		return sharedState;
 	}
 
+	@Override
+	public void setSuspended(boolean suspended) {
+		this.suspended = suspended;
+	}
+
 	/**
 	 * Check for a p-code injection (override) at the given address
 	 * 
@@ -257,19 +277,19 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 	}
 
 	@Override
-	public PcodeProgram compileSleigh(String sourceName, List<String> lines) {
-		return SleighProgramCompiler.compileProgram(language, sourceName, lines, stubLibrary);
+	public PcodeProgram compileSleigh(String sourceName, String source) {
+		return SleighProgramCompiler.compileProgram(language, sourceName, source, stubLibrary);
 	}
 
 	@Override
-	public void inject(Address address, List<String> sleigh) {
+	public void inject(Address address, String source) {
 		/**
 		 * TODO: Can I compile the template and build as if the inject were a
 		 * instruction:^instruction constructor? This would require me to delay that build until
 		 * execution, or at least check for instruction modification, if I do want to cache the
 		 * built p-code.
 		 */
-		PcodeProgram pcode = compileSleigh("machine_inject:" + address, sleigh);
+		PcodeProgram pcode = compileSleigh("machine_inject:" + address, source);
 		injects.put(address, pcode);
 	}
 
@@ -292,11 +312,91 @@ public abstract class AbstractPcodeMachine<T> implements PcodeMachine<T> {
 		 * addressed by formalizing and better exposing the notion of p-code stacks (of p-code
 		 * frames)
 		 */
-		PcodeProgram pcode = compileSleigh("breakpoint:" + address, List.of(
-			"if (!(" + sleighCondition + ")) goto <nobreak>;",
-			"    emu_swi();",
-			"<nobreak>",
-			"    emu_exec_decoded();"));
+		PcodeProgram pcode = compileSleigh("breakpoint:" + address, String.format("""
+				if (!(%s)) goto <nobreak>;
+					emu_swi();
+				<nobreak>
+					emu_exec_decoded();
+				""", sleighCondition));
 		injects.put(address, pcode);
+	}
+
+	@Override
+	public void addAccessBreakpoint(AddressRange range, AccessKind kind) {
+		accessBreakpoints.put(range, kind);
+	}
+
+	@Override
+	public void clearAccessBreakpoints() {
+		accessBreakpoints.clear();
+	}
+
+	/**
+	 * Perform checks on a requested LOAD
+	 * 
+	 * <p>
+	 * Throw an exception if the LOAD should cause an interrupt.
+	 * 
+	 * @param space the address space being accessed
+	 * @param offset the offset being accessed
+	 * @param size the size of the variable being accessed
+	 */
+	protected void checkLoad(AddressSpace space, T offset, int size) {
+		if (accessBreakpoints.isEmpty()) {
+			return;
+		}
+		try {
+			long concrete = arithmetic.toLong(offset, Purpose.LOAD);
+			if (accessBreakpoints.hasEntry(space.getAddress(concrete), AccessKind::trapsRead)) {
+				throw new InterruptPcodeExecutionException(null, null);
+			}
+		}
+		catch (ConcretionError e) {
+			// Consider this not hitting any breakpoint
+		}
+	}
+
+	/**
+	 * Perform checks on a requested STORE
+	 * 
+	 * <p>
+	 * Throw an exception if the STORE should cause an interrupt.
+	 * 
+	 * @param space the address space being accessed
+	 * @param offset the offset being accessed
+	 * @param size the size of the variable being accessed
+	 */
+	protected void checkStore(AddressSpace space, T offset, int size) {
+		if (accessBreakpoints.isEmpty()) {
+			return;
+		}
+		try {
+			long concrete = arithmetic.toLong(offset, Purpose.LOAD);
+			if (accessBreakpoints.hasEntry(space.getAddress(concrete), AccessKind::trapsWrite)) {
+				throw new InterruptPcodeExecutionException(null, null);
+			}
+		}
+		catch (ConcretionError e) {
+			// Consider this not hitting any breakpoint
+		}
+	}
+
+	/**
+	 * Throw a software interrupt exception if those interrupts are active
+	 */
+	protected void swi() {
+		if (swiMode == SwiMode.ACTIVE) {
+			throw new InterruptPcodeExecutionException(null, null);
+		}
+	}
+
+	/**
+	 * Notify the machine a thread has been stepped, so that it may re-enable software interrupts,
+	 * if applicable
+	 */
+	protected void stepped() {
+		if (swiMode == SwiMode.IGNORE_STEP) {
+			swiMode = SwiMode.ACTIVE;
+		}
 	}
 }

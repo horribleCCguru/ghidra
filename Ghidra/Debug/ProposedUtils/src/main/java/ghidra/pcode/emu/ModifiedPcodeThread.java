@@ -113,7 +113,15 @@ public class ModifiedPcodeThread<T> extends DefaultPcodeThread<T> {
 		}
 	}
 
-	// Part of the glue that makes existing state modifiers work in new emulation framework
+	/**
+	 * Part of the glue that makes existing state modifiers work in new emulation framework
+	 * 
+	 * <p>
+	 * <b>NOTE:</b> These are instantiated one per thread, rather than sharing one across the
+	 * machine, because some of the modifiers are stateful and assume a single-threaded model. The
+	 * best way to mitigate that assumption is to ensure a modifier is responsible for only a single
+	 * thread, even though a machine may have multiple threads.
+	 */
 	protected final EmulateInstructionStateModifier modifier;
 	protected final Emulate emulate;
 
@@ -177,7 +185,7 @@ public class ModifiedPcodeThread<T> extends DefaultPcodeThread<T> {
 	 */
 	protected int getBytesChunk(byte[] res, AddressSpace spc, long off, int size,
 			boolean stopOnUnintialized) {
-		T t = state.getVar(spc, off, size, true);
+		T t = state.getVar(spc, off, size, true, executor.getReason());
 		byte[] val = arithmetic.toConcrete(t, Purpose.OTHER);
 		System.arraycopy(val, 0, res, 0, val.length);
 		return val.length;
@@ -194,7 +202,8 @@ public class ModifiedPcodeThread<T> extends DefaultPcodeThread<T> {
 	}
 
 	@Override
-	protected void preExecuteInstruction() {
+	public void reInitialize() {
+		super.reInitialize();
 		if (modifier != null) {
 			savedCounter = getCounter();
 			modifier.initialExecuteCallback(emulate, savedCounter, getContext());

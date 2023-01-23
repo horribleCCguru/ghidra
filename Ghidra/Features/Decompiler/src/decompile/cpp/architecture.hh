@@ -61,6 +61,7 @@ public:
 
 class Architecture;
 
+extern AttributeId ATTRIB_ADDRESS;	///< Marshaling attribute "address"
 extern AttributeId ATTRIB_ADJUSTVMA;	///< Marshaling attribute "adjustvma"
 extern AttributeId ATTRIB_ENABLE;	///< Marshaling attribute "enable"
 extern AttributeId ATTRIB_GROUP;	///< Marshaling attribute "group"
@@ -216,11 +217,12 @@ public:
   void resetDefaults(void);		///< Reset defaults values for options owned by \b this
   ProtoModel *getModel(const string &nm) const;		///< Get a specific PrototypeModel
   bool hasModel(const string &nm) const;		///< Does this Architecture have a specific PrototypeModel
+  ProtoModel *createUnknownModel(const string &modelName);	///< Create a model for an unrecognized name
   bool highPtrPossible(const Address &loc,int4 size) const; ///< Are pointers possible to the given location?
   AddrSpace *getSpaceBySpacebase(const Address &loc,int4 size) const; ///< Get space associated with a \e spacebase register
   const LanedRegister *getLanedRegister(const Address &loc,int4 size) const;	///< Get LanedRegister associated with storage
   int4 getMinimumLanedRegisterSize(void) const;		///< Get the minimum size of a laned register in bytes
-  void setDefaultModel(const string &nm);		///< Set the default PrototypeModel
+  void setDefaultModel(ProtoModel *model);		///< Set the default PrototypeModel
   void clearAnalysis(Funcdata *fd);			///< Clear analysis specific to a function
   void readLoaderSymbols(const string &delim);		 ///< Read any symbols from loader into database
   void collectBehaviors(vector<OpBehavior *> &behave) const;	///< Provide a list of OpBehavior objects
@@ -272,13 +274,48 @@ protected:
   /// \return the PcodeInjectLibrary object
   virtual PcodeInjectLibrary *buildPcodeInjectLibrary(void)=0;
 
-  virtual void buildTypegrp(DocumentStorage &store);		///< Build the data-type factory/container
-  virtual void buildCommentDB(DocumentStorage &store);		///< Build the comment database
-  virtual void buildStringManager(DocumentStorage &store);	///< Build the string manager
-  virtual void buildConstantPool(DocumentStorage &store);	///< Build the constant pool
+  /// \brief Build the data-type factory/container
+  ///
+  /// Build the TypeFactory object specific to \b this Architecture and
+  /// prepopulate it with the \e core types. Core types may be pulled
+  /// from the configuration information, or default core types are used.
+  /// \param store contains possible configuration information
+  virtual void buildTypegrp(DocumentStorage &store)=0;
+
+  /// \brief Build the comment database
+  ///
+  /// Build the container that holds comments in \b this Architecture.
+  /// \param store may hold configuration information
+  virtual void buildCommentDB(DocumentStorage &store)=0;
+
+  /// \brief Build the string manager
+  ///
+  /// Build container that holds decoded strings for \b this Architecture.
+  /// \param store may hold configuration information
+  virtual void buildStringManager(DocumentStorage &store)=0;
+
+  /// \brief Build the constant pool
+  ///
+  /// Some processor models (Java byte-code) need a database of constants.
+  /// The database is always built, but may remain empty.
+  /// \param store may hold configuration information
+  virtual void buildConstantPool(DocumentStorage &store)=0;
+
   virtual void buildInstructions(DocumentStorage &store);	///< Register the p-code operations
   virtual void buildAction(DocumentStorage &store);		///< Build the Action framework
-  virtual void buildContext(DocumentStorage &store);		///< Build the Context database
+
+  /// \brief Build the Context database
+  ///
+  /// Build the database which holds status register settings and other
+  /// information that can affect disassembly depending on context.
+  /// \param store may hold configuration information
+  virtual void buildContext(DocumentStorage &store)=0;
+
+  /// \brief Build any symbols from spec files
+  ///
+  /// Formal symbols described in a spec file are added to the global scope.
+  /// \param store may hold symbol elements
+  virtual void buildSymbols(DocumentStorage &store)=0;
 
   /// \brief Load any relevant specification files
   ///

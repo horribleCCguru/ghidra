@@ -614,19 +614,31 @@ void PrintC::opCallind(const PcodeOp *op)
 void PrintC::opCallother(const PcodeOp *op)
 
 {
-  string nm = op->getOpcode()->getOperatorName(op);
-  pushOp(&function_call,op);
-  pushAtom(Atom(nm,optoken,EmitMarkup::funcname_color,op));
-  if (op->numInput() > 1) {
-    for(int4 i=1;i<op->numInput()-1;++i)
-      pushOp(&comma,op);
-  // implied vn's pushed on in reverse order for efficiency
-  // see PrintLanguage::pushVnImplied
-    for(int4 i=op->numInput()-1;i>=1;--i)
-      pushVn(op->getIn(i),op,mods);
+  UserPcodeOp *userop = glb->userops.getOp(op->getIn(0)->getOffset());
+  uint4 display = userop->getDisplay();
+  if (display == UserPcodeOp::annotation_assignment) {
+    pushOp(&assignment,op);
+    pushVn(op->getIn(2),op,mods);
+    pushVn(op->getIn(1),op,mods);
   }
-  else				// Push empty token for void
-    pushAtom(Atom(EMPTY_STRING,blanktoken,EmitMarkup::no_color));
+  else if (display == UserPcodeOp::no_operator) {
+    pushVn(op->getIn(1),op,mods);
+  }
+  else {	// Emit using functional syntax
+    string nm = op->getOpcode()->getOperatorName(op);
+    pushOp(&function_call,op);
+    pushAtom(Atom(nm,optoken,EmitMarkup::funcname_color,op));
+    if (op->numInput() > 1) {
+      for(int4 i = 1;i < op->numInput() - 1;++i)
+	pushOp(&comma,op);
+      // implied vn's pushed on in reverse order for efficiency
+      // see PrintLanguage::pushVnImplied
+      for(int4 i = op->numInput() - 1;i >= 1;--i)
+	pushVn(op->getIn(i),op,mods);
+    }
+    else
+      pushAtom(Atom(EMPTY_STRING,blanktoken,EmitMarkup::no_color));	// Push empty token for void
+  }
 }
 
 void PrintC::opConstructor(const PcodeOp *op,bool withNew)
@@ -746,14 +758,29 @@ void PrintC::opSubpiece(const PcodeOp *op)
 
 {
   if (op->doesSpecialPrinting()) {		// Special printing means it is a field extraction
-    int4 offset;
-    Datatype *ct;
-    const TypeField *field = TypeOpSubpiece::testExtraction(true, op, ct, offset);
-    if (field != (const TypeField *)0 && offset == 0) {
-      pushOp(&object_member,op);
-      pushVn(op->getIn(0), op, mods);
-      pushAtom(Atom(field->name,fieldtoken,EmitMarkup::no_color,ct,field->ident,op));
-      return;
+    const Varnode *vn = op->getIn(0);
+    Datatype *ct = vn->getHighTypeReadFacing(op);
+    if (ct->isPieceStructured()) {
+      int4 offset;
+      int4 byteOff = TypeOpSubpiece::computeByteOffsetForComposite(op);
+      const TypeField *field = ct->findTruncation(byteOff,op->getOut()->getSize(),op,1,offset);	// Use artificial slot
+      if (field != (const TypeField*)0 && offset == 0) {		// A formal structure field
+	pushOp(&object_member,op);
+	pushVn(vn,op,mods);
+	pushAtom(Atom(field->name,fieldtoken,EmitMarkup::no_color,ct,field->ident,op));
+	return;
+      }
+      else if (vn->isExplicit() && vn->getHigh()->getSymbolOffset() == -1) {	// An explicit, entire, structured object
+	Symbol *sym = vn->getHigh()->getSymbol();
+	if (sym != (Symbol *)0) {
+	  int4 sz = op->getOut()->getSize();
+	  int4 off = (int4)op->getIn(1)->getOffset();
+	  off = vn->getSpace()->isBigEndian() ? vn->getSize() - (sz + off) : off;
+	  pushPartialSymbol(sym, off, sz, vn, op, -1);
+	  return;
+	}
+      }
+      // Fall thru to functional printing
     }
   }
   if (castStrategy->isSubpieceCast(op->getOut()->getHighTypeDefFacing(),
@@ -876,7 +903,7 @@ void PrintC::opPtrsub(const PcodeOp *op)
       fieldtype = fld->type;
     }
     else {	// TYPE_STRUCT
-      const TypeField *fld = ((TypeStruct*)ct)->resolveTruncation((int4)suboff,0,&newoff);
+      const TypeField *fld = ct->findTruncation((int4)suboff,0,op,0,newoff);
       if (fld == (const TypeField*)0) {
 	if (ct->getSize() <= suboff) {
 	  clear();
@@ -1691,6 +1718,7 @@ void PrintC::pushConstant(uintb val,const Datatype *ct,
   case TYPE_STRUCT:
   case TYPE_UNION:
   case TYPE_PARTIALSTRUCT:
+  case TYPE_PARTIALUNION:
     break;
   }
   // Default printing
@@ -1754,21 +1782,8 @@ void PrintC::pushAnnotation(const Varnode *vn,const PcodeOp *op)
   const Scope *symScope = op->getParent()->getFuncdata()->getScopeLocal();
   int4 size = 0;
   if (op->code() == CPUI_CALLOTHER) {
-  // This construction is for volatile CALLOTHERs where the input annotation is the original address
-  // of the volatile access
     int4 userind = (int4)op->getIn(0)->getOffset();
-    VolatileWriteOp *vw_op = glb->userops.getVolatileWrite();
-    VolatileReadOp *vr_op = glb->userops.getVolatileRead();
-    if (userind == vw_op->getIndex()) {	// Annotation from a volatile write
-      size = op->getIn(2)->getSize(); // Get size from the 3rd parameter of write function
-    }
-    else if (userind == vr_op->getIndex()) {
-      const Varnode *outvn = op->getOut();
-      if (outvn != (const Varnode *)0)
-	size = op->getOut()->getSize(); // Get size from output of read function
-      else
-	size = 1;
-    }
+    size = glb->userops.getOp(userind)->extractAnnotationSize(vn, op);
   }
   SymbolEntry *entry;
   if (size != 0)
@@ -1792,11 +1807,16 @@ void PrintC::pushAnnotation(const Varnode *vn,const PcodeOp *op)
   else {
     string regname = glb->translate->getRegisterName(vn->getSpace(),vn->getOffset(),size);
     if (regname.empty()) {
-      Datatype *ct = glb->types->getBase(size,TYPE_UINT);
-      pushConstant(AddrSpace::byteToAddress(vn->getOffset(),vn->getSpace()->getWordSize()),ct,vn,op);
+      AddrSpace *spc = vn->getSpace();
+      string spacename = spc->getName();
+      spacename[0] = toupper( spacename[0] ); // Capitalize space
+      ostringstream s;
+      s << spacename;
+      s << hex << setfill('0') << setw(2*spc->getAddrSize());
+      s << AddrSpace::byteToAddress( vn->getOffset(), spc->getWordSize() );
+      regname = s.str();
     }
-    else
-      pushAtom(Atom(regname,vartoken,EmitMarkup::var_color,op,vn));
+    pushAtom(Atom(regname,vartoken,EmitMarkup::special_color,op,vn));
   }
 }
 
@@ -1804,7 +1824,9 @@ void PrintC::pushSymbol(const Symbol *sym,const Varnode *vn,const PcodeOp *op)
 
 {
   EmitMarkup::syntax_highlight tokenColor;
-  if (sym->getScope()->isGlobal())
+  if (sym->isVolatile())
+    tokenColor = EmitMarkup::special_color;
+  else if (sym->getScope()->isGlobal())
     tokenColor = EmitMarkup::global_color;
   else if (sym->getCategory() == Symbol::function_parameter)
     tokenColor = EmitMarkup::param_color;
@@ -1863,7 +1885,7 @@ void PrintC::pushPartialSymbol(const Symbol *sym,int4 off,int4 sz,
 	  break;	// Turns out we don't resolve to the field
       }
       const TypeField *field;
-      field = ((TypeStruct *)ct)->resolveTruncation(off,sz,&off);
+      field = ct->findTruncation(off,sz,op,inslot,off);
       if (field != (const TypeField *)0) {
 	stack.emplace_back();
 	PartialSymbolEntry &entry( stack.back() );
@@ -1894,7 +1916,7 @@ void PrintC::pushPartialSymbol(const Symbol *sym,int4 off,int4 sz,
     }
     else if (ct->getMetatype() == TYPE_UNION) {
       const TypeField *field;
-      field = ((TypeUnion *)ct)->findTruncation(off,op,inslot,off);
+      field = ct->findTruncation(off,sz,op,inslot,off);
       if (field != (const TypeField*)0) {
 	stack.emplace_back();
 	PartialSymbolEntry &entry(stack.back());
@@ -1923,13 +1945,9 @@ void PrintC::pushPartialSymbol(const Symbol *sym,int4 off,int4 sz,
       stack.emplace_back();
       PartialSymbolEntry &entry(stack.back());
       entry.token = &object_member;
-      ostringstream s;
       if (sz == 0)
 	sz = ct->getSize() - off;
-      // Special notation for subpiece which is neither
-      // array entry nor struct field
-      s << '_' << dec << off << '_' << sz << '_';
-      entry.fieldname = s.str();
+      entry.fieldname = unnamedField(off, sz);	// If nothing else works, generate artificial field name
       entry.field = (const TypeField *)0;
       entry.hilite = EmitMarkup::no_color;
       ct = (Datatype *)0;
@@ -2479,11 +2497,10 @@ void PrintC::emitFunctionDeclaration(const Funcdata *fd)
   emitPrototypeOutput(proto,fd);
   emit->spaces(1);
   if (option_convention) {
-    if (fd->getFuncProto().hasModel()) {
-      if (!fd->getFuncProto().hasMatchingModel(fd->getArch()->defaultfp)) { // If not the default
-	emit->print(fd->getFuncProto().getModelName(),EmitMarkup::keyword_color);
-	emit->spaces(1);
-      }
+    if (fd->getFuncProto().printModelInDecl()) {
+      Emit::syntax_highlight highlight = fd->getFuncProto().isModelUnknown() ? Emit::error_color : Emit::keyword_color;
+      emit->print(fd->getFuncProto().getModelName(),highlight);
+      emit->spaces(1);
     }
   }
   int4 id1 = emit->openGroup();

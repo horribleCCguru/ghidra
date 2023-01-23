@@ -15,8 +15,10 @@
  */
 package ghidra.pcode.exec;
 
+import java.util.Map;
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.program.model.address.*;
+import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.MemBuffer;
 import ghidra.program.model.pcode.Varnode;
@@ -39,6 +41,16 @@ import ghidra.program.model.pcode.Varnode;
 public interface PcodeExecutorStatePiece<A, T> {
 
 	/**
+	 * Reasons for reading state
+	 */
+	enum Reason {
+		/** The value is needed by the emulator in the course of execution */
+		EXECUTE,
+		/** The value is being inspected */
+		INSPECT
+	}
+
+	/**
 	 * Construct a range, if only to verify the range is valid
 	 * 
 	 * @param space the address space
@@ -56,6 +68,13 @@ public interface PcodeExecutorStatePiece<A, T> {
 	}
 
 	/**
+	 * Get the language defining the address spaces of this state piece
+	 * 
+	 * @return the language
+	 */
+	Language getLanguage();
+
+	/**
 	 * Get the arithmetic used to manipulate addresses of the type used by this state
 	 * 
 	 * @return the address (or offset) arithmetic
@@ -68,6 +87,13 @@ public interface PcodeExecutorStatePiece<A, T> {
 	 * @return the arithmetic
 	 */
 	PcodeArithmetic<T> getArithmetic();
+
+	/**
+	 * Create a deep copy of this state
+	 * 
+	 * @return the copy
+	 */
+	PcodeExecutorStatePiece<A, T> fork();
 
 	/**
 	 * Set the value of a register variable
@@ -133,23 +159,25 @@ public interface PcodeExecutorStatePiece<A, T> {
 	 * Get the value of a register variable
 	 * 
 	 * @param reg the register
+	 * @param reason the reason for reading the register
 	 * @return the value
 	 */
-	default T getVar(Register reg) {
+	default T getVar(Register reg, Reason reason) {
 		Address address = reg.getAddress();
 		return getVar(address.getAddressSpace(), address.getOffset(), reg.getMinimumByteSize(),
-			true);
+			true, reason);
 	}
 
 	/**
 	 * Get the value of a variable
 	 * 
 	 * @param var the variable
+	 * @param reason the reason for reading the variable
 	 * @return the value
 	 */
-	default T getVar(Varnode var) {
+	default T getVar(Varnode var, Reason reason) {
 		Address address = var.getAddress();
-		return getVar(address.getAddressSpace(), address.getOffset(), var.getSize(), true);
+		return getVar(address.getAddressSpace(), address.getOffset(), var.getSize(), true, reason);
 	}
 
 	/**
@@ -159,9 +187,10 @@ public interface PcodeExecutorStatePiece<A, T> {
 	 * @param offset the offset within the space
 	 * @param size the size of the variable
 	 * @param quantize true to quantize to the language's "addressable unit"
+	 * @param reason the reason for reading the variable
 	 * @return the value
 	 */
-	T getVar(AddressSpace space, A offset, int size, boolean quantize);
+	T getVar(AddressSpace space, A offset, int size, boolean quantize, Reason reason);
 
 	/**
 	 * Get the value of a variable
@@ -173,12 +202,13 @@ public interface PcodeExecutorStatePiece<A, T> {
 	 * @param offset the offset within the space
 	 * @param size the size of the variable
 	 * @param quantize true to quantize to the language's "addressable unit"
+	 * @param reason the reason for reading the variable
 	 * @return the value
 	 */
-	default T getVar(AddressSpace space, long offset, int size, boolean quantize) {
+	default T getVar(AddressSpace space, long offset, int size, boolean quantize, Reason reason) {
 		checkRange(space, offset, size);
 		A aOffset = getAddressArithmetic().fromConst(offset, space.getPointerSize());
-		return getVar(space, aOffset, size, quantize);
+		return getVar(space, aOffset, size, quantize, reason);
 	}
 
 	/**
@@ -190,11 +220,22 @@ public interface PcodeExecutorStatePiece<A, T> {
 	 * @param address the address of the variable
 	 * @param size the size of the variable
 	 * @param quantize true to quantize to the language's "addressable unit"
+	 * @param reason the reason for reading the variable
 	 * @return the value
 	 */
-	default T getVar(Address address, int size, boolean quantize) {
-		return getVar(address.getAddressSpace(), address.getOffset(), size, quantize);
+	default T getVar(Address address, int size, boolean quantize, Reason reason) {
+		return getVar(address.getAddressSpace(), address.getOffset(), size, quantize, reason);
 	}
+
+	/**
+	 * Get all register values known to this state
+	 * 
+	 * <p>
+	 * When the state acts as a cache, it should only return those cached.
+	 * 
+	 * @return a map of registers and their values
+	 */
+	Map<Register, T> getRegisterValues();
 
 	/**
 	 * Bind a buffer of concrete bytes at the given start address
@@ -215,4 +256,15 @@ public interface PcodeExecutorStatePiece<A, T> {
 	default long quantizeOffset(AddressSpace space, long offset) {
 		return space.truncateAddressableWordOffset(offset) * space.getAddressableUnitSize();
 	}
+
+	/**
+	 * Erase the entire state or piece
+	 * 
+	 * <p>
+	 * This is generally only useful when the state is itself a cache to another object. This will
+	 * ensure the state is reading from that object rather than a stale cache. If this is not a
+	 * cache, this could in fact clear the whole state, and the machine using it will be left in the
+	 * dark.
+	 */
+	void clear();
 }

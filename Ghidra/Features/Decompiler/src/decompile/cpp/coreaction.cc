@@ -1120,7 +1120,7 @@ SymbolEntry *ActionConstantPtr::isPointer(AddrSpace *spc,Varnode *vn,PcodeOp *op
 int4 ActionConstantPtr::apply(Funcdata &data)
 
 {
-  if (!data.isTypeRecoveryOn()) return 0;
+  if (!data.hasTypeRecoveryStarted()) return 0;
 
   if (localcount >= 4)		// At most 4 passes (once type recovery starts)
     return 0;
@@ -1208,7 +1208,7 @@ int4 ActionDeindirect::apply(Funcdata &data)
 	continue;
       }
     }
-    if (data.isTypeRecoveryOn()) {
+    if (data.hasTypeRecoveryStarted()) {
       // Check for a function pointer that has an attached prototype
       Datatype *ct = op->getIn(0)->getTypeReadFacing(op);
       if ((ct->getMetatype()==TYPE_PTR)&&
@@ -1481,15 +1481,29 @@ void ActionFuncLink::funcLinkInput(FuncCallSpecs *fc,Funcdata &data)
 void ActionFuncLink::funcLinkOutput(FuncCallSpecs *fc,Funcdata &data)
 
 {
+  PcodeOp *callop = fc->getOp();
+  if (callop->getOut() != (Varnode *)0) {
+    // CALL ops are expected to have no output, but its possible an override has produced one
+    if (callop->getOut()->getSpace()->getType() == IPTR_INTERNAL) {
+      // Removing a varnode in the unique space will likely produce an input varnode in the unique space
+      ostringstream s;
+      s << "CALL op at ";
+      callop->getAddr().printRaw(s);
+      s << " has an unexpected output varnode";
+      throw LowlevelError(s.str());
+    }
+    // Otherwise just remove the Varnode and assume return recovery will reintroduce it if necessary
+    data.opUnsetOutput(callop);
+  }
   if (fc->isOutputLocked()) {
     ProtoParameter *outparam = fc->getOutput();
     Datatype *outtype = outparam->getType();
     if (outtype->getMetatype() != TYPE_VOID) {
       int4 sz = outparam->getSize();
-      if (sz == 1 && outtype->getMetatype() == TYPE_BOOL)
-	data.opMarkCalculatedBool(fc->getOp());
+      if (sz == 1 && outtype->getMetatype() == TYPE_BOOL && data.isTypeRecoveryOn())
+	data.opMarkCalculatedBool(callop);
       Address addr = outparam->getAddress();
-      data.newVarnodeOut(sz,addr,fc->getOp());
+      data.newVarnodeOut(sz,addr,callop);
       VarnodeData vdata;
       OpCode res = fc->assumedOutputExtension(addr,sz,vdata);
       if (res == CPUI_PIECE) {		// Pick an extension based on type
@@ -1499,7 +1513,6 @@ void ActionFuncLink::funcLinkOutput(FuncCallSpecs *fc,Funcdata &data)
 	  res = CPUI_INT_ZEXT;
       }
       if (res != CPUI_COPY) { // We assume the (smallsize) output is extended to a full register
-	PcodeOp *callop = fc->getOp();
 	// Create the extension operation to eliminate artifact
 	PcodeOp *op = data.newOp(1,callop->getAddr());
 	data.newVarnodeOut(vdata.size,vdata.getAddr(),op);
@@ -2116,10 +2129,9 @@ int4 ActionRestructureVarnode::apply(Funcdata &data)
 {
   ScopeLocal *l1 = data.getScopeLocal();
 
-  bool aliasyes = data.isJumptableRecoveryOn() ? false : (numpass != 0);
+  bool aliasyes = (numpass != 0);	// Alias calculations are not reliable on the first pass
   l1->restructureVarnode(aliasyes);
-  // Note the alias calculation, may not be very good on the first pass
-  if (data.syncVarnodesWithSymbols(l1,false))
+  if (data.syncVarnodesWithSymbols(l1,false,aliasyes))
     count += 1;
 
   numpass += 1;
@@ -2144,7 +2156,7 @@ int4 ActionRestructureHigh::apply(Funcdata &data)
 #endif
 
   l1->restructureHigh();
-  if (data.syncVarnodesWithSymbols(l1,true))
+  if (data.syncVarnodesWithSymbols(l1,true,true))
     count += 1;
 
 #ifdef OPACTION_DEBUG
@@ -2174,7 +2186,7 @@ int4 ActionDefaultParams::apply(Funcdata &data)
 
       if (otherfunc != (Funcdata *)0) {
 	fc->copy(otherfunc->getFuncProto());
-	if ((!fc->isModelLocked())&&(!fc->hasMatchingModel(evalfp)))
+	if ((!fc->isModelLocked())&& !fc->hasMatchingModel(evalfp))
 	  fc->setModel(evalfp);
       }
       else
@@ -2334,6 +2346,8 @@ int4 ActionSetCasts::resolveUnion(PcodeOp *op,int4 slot,Funcdata &data)
   Datatype *dt = vn->getHigh()->getType();
   if (!dt->needsResolution())
     return 0;
+  if (dt != vn->getType())
+    dt->resolveInFlow(op, slot);	// Last chance to resolve data-type based on flow
   const ResolvedUnion *resUnion = data.getUnionField(dt, op,slot);
   if (resUnion != (ResolvedUnion*)0 && resUnion->getFieldNum() >= 0) {
     // Insert specific placeholder indicating which field is accessed
@@ -2383,8 +2397,12 @@ int4 ActionSetCasts::castOutput(PcodeOp *op,Funcdata &data,CastStrategy *castStr
     // Short circuit more sophisticated casting tests.  If they are the same type, there is no cast
     return 0;
   }
-  if (outHighType->needsResolution())
-    outHighType = outHighType->findResolve(op, -1);	// Finish fetching DefFacing data-type
+  Datatype *outHighResolve = outHighType;
+  if (outHighType->needsResolution()) {
+    if (outHighType != outvn->getType())
+      outHighType->resolveInFlow(op, -1);		// Last chance to resolve data-type based on flow
+    outHighResolve = outHighType->findResolve(op, -1);	// Finish fetching DefFacing data-type
+  }
   if (outvn->isImplied()) {
     // implied varnode must have parse type
     if (outvn->isTypeLock()) {
@@ -2392,25 +2410,25 @@ int4 ActionSetCasts::castOutput(PcodeOp *op,Funcdata &data,CastStrategy *castStr
       // The Varnode input to a CPUI_RETURN is marked as implied but
       // casting should act as if it were explicit
       if (outOp == (PcodeOp *)0 || outOp->code() != CPUI_RETURN) {
-	force = !isOpIdentical(outHighType, tokenct);
+	force = !isOpIdentical(outHighResolve, tokenct);
       }
     }
-    else if (outHighType->getMetatype() != TYPE_PTR) {	// If implied varnode has an atomic (non-pointer) type
+    else if (outHighResolve->getMetatype() != TYPE_PTR) {	// If implied varnode has an atomic (non-pointer) type
       outvn->updateType(tokenct,false,false); // Ignore it in favor of the token type
-      outHighType = outvn->getHighTypeDefFacing();
+      outHighResolve = outvn->getHighTypeDefFacing();
     }
     else if (tokenct->getMetatype() == TYPE_PTR) { // If the token is a pointer AND implied varnode is pointer
-      outct = ((TypePointer *)outHighType)->getPtrTo();
+      outct = ((TypePointer *)outHighResolve)->getPtrTo();
       type_metatype meta = outct->getMetatype();
       // Preserve implied pointer if it points to a composite
       if ((meta!=TYPE_ARRAY)&&(meta!=TYPE_STRUCT)&&(meta!=TYPE_UNION)) {
 	outvn->updateType(tokenct,false,false); // Otherwise ignore it in favor of the token type
-	outHighType = outvn->getHighTypeDefFacing();
+	outHighResolve = outvn->getHighTypeDefFacing();
       }
     }
   }
   if (!force) {
-    outct = outHighType;	// Type of result
+    outct = outHighResolve;	// Type of result
     ct = castStrategy->castStandard(outct,tokenct,false,true);
     if (ct == (Datatype *)0) return 0;
   }
@@ -2427,8 +2445,10 @@ int4 ActionSetCasts::castOutput(PcodeOp *op,Funcdata &data,CastStrategy *castStr
   data.opSetInput(newop,vn,0);
   data.opSetOutput(op,vn);
   data.opInsertAfter(newop,op); // Cast comes AFTER this operation
+  if (tokenct->needsResolution())
+    data.forceFacingType(tokenct, -1, newop, 0);
   if (outHighType->needsResolution())
-    data.forceFacingType(outHighType, -1, newop, -1);
+    data.inheritResolution(outHighType, newop, -1, op, -1);	// Inherit write resolution
 
   return 1;
 }
@@ -2502,7 +2522,9 @@ int4 ActionSetCasts::castInput(PcodeOp *op,int4 slot,Funcdata &data,CastStrategy
   }
   else if (testStructOffset0(vn, op, ct, castStrategy)) {
     // Insert a PTRSUB(vn,#0) instead of a CAST
-    insertPtrsubZero(op, slot, ct, data);
+    newop = insertPtrsubZero(op, slot, ct, data);
+    if (vn->getHigh()->getType()->needsResolution())
+      data.inheritResolution(vn->getHigh()->getType(),newop, 0, op, slot);
     return 1;
   }
   else if (tryResolutionAdjustment(op, slot, data)) {
@@ -2523,7 +2545,7 @@ int4 ActionSetCasts::castInput(PcodeOp *op,int4 slot,Funcdata &data,CastStrategy
     data.forceFacingType(ct, -1, newop, -1);
   }
   if (vn->getHigh()->getType()->needsResolution()) {
-    data.inheritReadResolution(newop, 0, op, slot);
+    data.inheritResolution(vn->getHigh()->getType(),newop, 0, op, slot);
   }
   return 1;
 }
@@ -2808,7 +2830,7 @@ int4 ActionNameVars::apply(Funcdata &data)
 /// and that it needs special printing.
 /// \param vn is the given Varnode
 /// \param maxref is the maximum number of references to consider before forcing explicitness
-/// \return -1 if given Varnode should be marked explicit, the number of descendants otherwise
+/// \return -1 or -2 if given Varnode should be marked explicit, the number of descendants otherwise
 int4 ActionMarkExplicit::baseExplicit(Varnode *vn,int4 maxref)
 
 {
@@ -2828,29 +2850,53 @@ int4 ActionMarkExplicit::baseExplicit(Varnode *vn,int4 maxref)
     if (def->code() == CPUI_SUBPIECE) {
       Varnode *vin = def->getIn(0);
       if (vin->isAddrTied()) {
-	if (vn->overlap(*vin) == def->getIn(1)->getOffset())
-	  return -1;		// Should be explicit, will be a copymarker and not printed
+        if (vn->overlap(*vin) == def->getIn(1)->getOffset())
+          return -1;		// Should be explicit, will be a copymarker and not printed
       }
     }
-    // (Part of) an addrtied location into itself is hopefully implicit
-    bool shouldbeimplicit = true;
-    for(iter=vn->beginDescend();iter!=vn->endDescend();++iter) {
-      PcodeOp *op = *iter;
-      if ((op->code()!=CPUI_INT_ZEXT)&&(op->code()!=CPUI_PIECE)) {
-	shouldbeimplicit = false;
-	break;
-      }
-      Varnode *vnout = op->getOut();
-      if ((!vnout->isAddrTied())||(0!=vnout->contains(*vn))) {
-	shouldbeimplicit = false;
-	break;
+    PcodeOp *useOp = vn->loneDescend();
+    if (useOp == (PcodeOp *)0) return -1;
+    if (useOp->code() == CPUI_INT_ZEXT) {
+      Varnode *vnout = useOp->getOut();
+      if ((!vnout->isAddrTied())||(0!=vnout->contains(*vn)))
+	return -1;
+    }
+    else if (useOp->code() == CPUI_PIECE) {
+      Varnode *rootVn = PieceNode::findRoot(vn);
+      if (vn == rootVn) return -1;
+      Datatype *ct = rootVn->getStructuredType();
+      if (ct != (Datatype *)0) {
+	// Getting PIECEd into a structured thing.  Unless vn is a leaf, it should be implicit
+	if (def->code() != CPUI_PIECE) return -1;
+	if (vn->loneDescend() == (PcodeOp *)0) return -1;
+	Varnode *vn0 = def->getIn(0);
+	Varnode *vn1 = def->getIn(1);
+	Address addr = vn->getAddr();
+	if (!addr.getSpace()->isBigEndian())
+	  addr = addr + vn1->getSize();
+	if (addr != vn0->getAddr()) return -1;
+	addr = vn->getAddr();
+	if (addr.getSpace()->isBigEndian())
+	  addr = addr + vn0->getSize();
+	if (addr != vn1->getAddr()) return -1;
+	// If we reach here vn is a non-leaf in a CONCAT tree and should be implicit
       }
     }
-    if (!shouldbeimplicit) return -1;
+    else {
+      return -1;
+    }
   }
   else if (vn->isMapped()) {
     // If NOT addrtied but is still mapped, there must be either a first use (register) mapping
     // or a dynamic mapping causing the bit to be set. In either case, it should probably be explicit
+    return -1;
+  }
+  else if (vn->isProtoPartial() && def->code() != CPUI_PIECE) {
+    // Varnode is part of structure. Write to structure should be an explicit statement
+    return -1;
+  }
+  else if (def->code() == CPUI_PIECE && def->getIn(0)->isProtoPartial() && !vn->isProtoPartial()) {
+    // The base of PIECE operations building a structure
     return -1;
   }
   if (vn->hasNoDescend()) return -1;	// Must have at least one descendant
@@ -3808,6 +3854,8 @@ int4 ActionDeadCode::apply(Funcdata &data)
       }
       if (!op->isAssignment())
 	continue;
+      if (op->holdOutput())
+	pushConsumed(~((uintb)0),op->getOut(),worklist);
     }
     else if (!op->isAssignment()) {
       OpCode opc = op->code();
@@ -4060,7 +4108,7 @@ int4 ActionPrototypeTypes::apply(Funcdata &data)
   ProtoModel *evalfp = data.getArch()->evalfp_current;
   if (evalfp == (ProtoModel *)0)
     evalfp = data.getArch()->defaultfp;
-  if ((!data.getFuncProto().isModelLocked())&&(!data.getFuncProto().hasMatchingModel(evalfp)))
+  if ((!data.getFuncProto().isModelLocked()) && !data.getFuncProto().hasMatchingModel(evalfp))
     data.getFuncProto().setModel(evalfp);
   if (data.getFuncProto().hasThisPointer())
     data.prepareThisPointer();
@@ -4340,10 +4388,15 @@ int4 ActionPrototypeWarnings::apply(Funcdata &data)
   if (ourproto.hasOutputErrors()) {
     data.warningHeader("Cannot assign location of return value for this function: Return value may be inaccurate");
   }
-  if (ourproto.isUnknownModel() && (!ourproto.hasCustomStorage()) &&
-  	(ourproto.isInputLocked() || ourproto.isOutputLocked())) {
-    data.warningHeader("Unknown calling convention yet parameter storage is locked");
-  }
+  if (ourproto.isModelUnknown()) {
+    ostringstream s;
+    s << "Unknown calling convention";
+    if (ourproto.printModelInDecl())
+      s << ": " << ourproto.getModelName();
+    if (!ourproto.hasCustomStorage() && (ourproto.isInputLocked() || ourproto.isOutputLocked()))
+      s << " -- yet parameter storage is locked";
+    data.warningHeader(s.str());
+ }
   int4 numcalls = data.numCalls();
   for(int4 i=0;i<numcalls;++i) {
     FuncCallSpecs *fc = data.getCallSpecs(i);
@@ -4478,17 +4531,18 @@ bool ActionInferTypes::propagateTypeEdge(TypeFactory *typegrp,PcodeOp *op,int4 i
 {
   Varnode *invn,*outvn;
 
+  invn = (inslot==-1) ? op->getOut() : op->getIn(inslot);
+  Datatype *alttype = invn->getTempType();
+  if (alttype->needsResolution()) {
+    // Always give incoming data-type a chance to resolve, even if it would not otherwise propagate
+    alttype = alttype->resolveInFlow(op, inslot);
+  }
   if (inslot == outslot) return false; // don't backtrack
   if (outslot < 0)
     outvn = op->getOut();
   else {
     outvn = op->getIn(outslot);
     if (outvn->isAnnotation()) return false;
-  }
-  invn = (inslot==-1) ? op->getOut() : op->getIn(inslot);
-  Datatype *alttype = invn->getTempType();
-  if (alttype->needsResolution()) {
-    alttype = alttype->resolveInFlow(op, inslot);
   }
   if (outvn->isTypeLock()) return false; // Can't propagate through typelock
   if (outvn->stopsUpPropagation() && outslot >= 0) return false;	// Propagation is blocked
@@ -4631,6 +4685,8 @@ void ActionInferTypes::propagateRef(Funcdata &data,Varnode *vn,const Address &ad
     ++iter;
     if (curvn->isAnnotation()) continue;
     if ((!curvn->isWritten())&&curvn->hasNoDescend()) continue;
+    if (curvn->isTypeLock()) continue;
+    if (curvn->getSymbolEntry() != (SymbolEntry *)0) continue;
     uintb curoff = curvn->getOffset() - off;
     int4 cursize = curvn->getSize();
     if (curoff + cursize > ct->getSize()) continue;
@@ -4778,7 +4834,7 @@ int4 ActionInferTypes::apply(Funcdata &data)
 
 {
   // Make sure spacebase is accurate or bases could get typed and then ptrarithed
-  if (!data.isTypeRecoveryOn()) return 0;
+  if (!data.hasTypeRecoveryStarted()) return 0;
   TypeFactory *typegrp = data.getArch()->types;
   Varnode *vn;
   VarnodeLocSet::const_iterator iter;
@@ -5037,7 +5093,6 @@ void ActionDatabase::universalAction(Architecture *conf)
 	actprop->addRule( new RuleShiftAnd("analysis") );
 	actprop->addRule( new RuleConcatZero("analysis") );
 	actprop->addRule( new RuleConcatLeftShift("analysis") );
-	actprop->addRule( new RuleEmbed("analysis") );
 	actprop->addRule( new RuleSubZext("analysis") );
 	actprop->addRule( new RuleSubCancel("analysis") );
 	actprop->addRule( new RuleShiftSub("analysis") );
@@ -5051,9 +5106,14 @@ void ActionDatabase::universalAction(Architecture *conf)
 	actprop->addRule( new RuleDivTermAdd2("analysis") );
 	actprop->addRule( new RuleDivOpt("analysis") );
 	actprop->addRule( new RuleSignForm("analysis") );
+	actprop->addRule( new RuleSignForm2("analysis") );
 	actprop->addRule( new RuleSignDiv2("analysis") );
+	actprop->addRule( new RuleDivChain("analysis") );
 	actprop->addRule( new RuleSignNearMult("analysis") );
 	actprop->addRule( new RuleModOpt("analysis") );
+	actprop->addRule( new RuleSignMod2nOpt("analysis") );
+	actprop->addRule( new RuleSignMod2nOpt2("analysis") );
+	actprop->addRule( new RuleSignMod2Opt("analysis") );
 	actprop->addRule( new RuleSwitchSingle("analysis") );
 	actprop->addRule( new RuleCondNegate("analysis") );
 	actprop->addRule( new RuleBoolNegate("analysis") );
@@ -5144,6 +5204,7 @@ void ActionDatabase::universalAction(Architecture *conf)
     actcleanup->addRule( new RuleSubRight("cleanup") );
     actcleanup->addRule( new RulePtrsubCharConstant("cleanup") );
     actcleanup->addRule( new RuleExtensionPush("cleanup") );
+    actcleanup->addRule( new RulePieceStructure("cleanup") );
   }
   act->addAction( actcleanup );
 

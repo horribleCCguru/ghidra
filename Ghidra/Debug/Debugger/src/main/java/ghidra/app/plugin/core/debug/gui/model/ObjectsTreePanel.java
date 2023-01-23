@@ -25,8 +25,6 @@ import javax.swing.JPanel;
 import javax.swing.JTree;
 import javax.swing.tree.TreePath;
 
-import com.google.common.collect.Range;
-
 import docking.widgets.tree.GTree;
 import docking.widgets.tree.support.GTreeRenderer;
 import docking.widgets.tree.support.GTreeSelectionEvent.EventOrigin;
@@ -34,6 +32,7 @@ import docking.widgets.tree.support.GTreeSelectionListener;
 import ghidra.app.plugin.core.debug.DebuggerCoordinates;
 import ghidra.app.plugin.core.debug.gui.DebuggerResources;
 import ghidra.app.plugin.core.debug.gui.model.ObjectTreeModel.AbstractNode;
+import ghidra.trace.model.Lifespan;
 import ghidra.trace.model.Trace;
 import ghidra.trace.model.target.TraceObjectKeyPath;
 
@@ -78,8 +77,8 @@ public class ObjectsTreePanel extends JPanel {
 	protected boolean showPrimitives = false;
 	protected boolean showMethods = false;
 
-	protected Color diffColor = DebuggerResources.DEFAULT_COLOR_VALUE_CHANGED;
-	protected Color diffColorSel = DebuggerResources.DEFAULT_COLOR_VALUE_CHANGED_SEL;
+	protected Color diffColor = DebuggerResources.COLOR_VALUE_CHANGED;
+	protected Color diffColorSel = DebuggerResources.COLOR_VALUE_CHANGED_SEL;
 
 	public ObjectsTreePanel() {
 		super(new BorderLayout());
@@ -125,7 +124,7 @@ public class ObjectsTreePanel extends JPanel {
 			treeModel.setDiffSnap(previous.getSnap());
 			treeModel.setSnap(current.getSnap());
 			if (limitToSnap) {
-				treeModel.setSpan(Range.singleton(current.getSnap()));
+				treeModel.setSpan(Lifespan.at(current.getSnap()));
 			}
 			tree.filterChanged();
 		}
@@ -137,7 +136,7 @@ public class ObjectsTreePanel extends JPanel {
 		}
 		this.limitToSnap = limitToSnap;
 		try (KeepTreeState keep = keepTreeState()) {
-			treeModel.setSpan(limitToSnap ? Range.singleton(current.getSnap()) : Range.all());
+			treeModel.setSpan(limitToSnap ? Lifespan.at(current.getSnap()) : Lifespan.ALL);
 		}
 	}
 

@@ -15,10 +15,10 @@
  */
 package ghidra.pcode.emu.taint.plain;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 import ghidra.pcode.emu.taint.trace.TaintTraceSpace;
+import ghidra.program.model.lang.Register;
 import ghidra.taint.model.TaintSet;
 import ghidra.taint.model.TaintVec;
 
@@ -62,10 +62,10 @@ public class TaintSpace {
 	 * Retrieve the taint sets for the variable at the given offset
 	 * 
 	 * <p>
-	 * This retrieves as many taint sets as there are elements in the given buffer vector. This first
-	 * element becomes the taint set at the given offset, then each subsequent element becomes the
-	 * taint set at each subsequent offset until the vector is filled. This is analogous to the
-	 * manner in which bytes would be "read" from concrete state, starting at a given ofset, into a
+	 * This retrieves as many taint sets as there are elements in the given buffer vector. This
+	 * first element becomes the taint set at the given offset, then each subsequent element becomes
+	 * the taint set at each subsequent offset until the vector is filled. This is analogous to the
+	 * manner in which bytes would be "read" from concrete state, starting at a given offset, into a
 	 * destination array.
 	 * 
 	 * @param offset the offset
@@ -107,5 +107,25 @@ public class TaintSpace {
 	 */
 	protected TaintSet whenNull(long offset) {
 		return TaintSet.EMPTY;
+	}
+
+	public void clear() {
+		taints.clear();
+	}
+
+	public Map<Register, TaintVec> getRegisterValues(List<Register> registers) {
+		Map<Register, TaintVec> result = new HashMap<>();
+		for (Register r : registers) {
+			long offset = r.getAddress().getOffset();
+			TaintVec vec = new TaintVec(r.getNumBytes());
+			for (int i = 0; i < vec.length; i++) {
+				TaintSet s = taints.get(offset + i);
+				if (s == null) {
+					continue;
+				}
+			}
+			result.put(r, vec);
+		}
+		return result;
 	}
 }

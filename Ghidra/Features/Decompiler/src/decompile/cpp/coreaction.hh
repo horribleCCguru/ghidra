@@ -65,9 +65,14 @@ public:
 };
 
 /// \brief Allow type recovery to start happening
+///
+/// The presence of \b this Action causes the function to be marked that data-type analysis
+/// will be performed.  Then when \b this action is applied during analysis, the function is marked
+/// that data-type analysis has started.
 class ActionStartTypes : public Action {
 public:
   ActionStartTypes(const string &g) : Action(0,"starttypes",g) {}	///< Constructor
+  virtual void reset(Funcdata &data) { data.setTypeRecovery(true); }
   virtual Action *clone(const ActionGroupList &grouplist) const {
     if (!grouplist.contains(getGroup())) return (Action *)0;
     return new ActionStartTypes(getGroup());
@@ -359,7 +364,7 @@ public:
     return new ActionMergeRequired(getGroup());
   }
   virtual int4 apply(Funcdata &data) { 
-    data.getMerge().mergeAddrTied(); data.getMerge().mergeMarker(); return 0; }
+    data.getMerge().mergeAddrTied(); data.getMerge().groupPartials(); data.getMerge().mergeMarker(); return 0; }
 };
 
 /// \brief Try to merge an op's input Varnode to its output, if they are at the same storage location.

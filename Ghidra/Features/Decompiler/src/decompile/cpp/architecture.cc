@@ -22,13 +22,15 @@
 #endif
 #ifdef CPUI_STATISTICS
 #include <cmath>
+using std::sqrt;
 #endif
 
 vector<ArchitectureCapability *> ArchitectureCapability::thelist;
 
-const uint4 ArchitectureCapability::majorversion = 4;
-const uint4 ArchitectureCapability::minorversion = 1;
+const uint4 ArchitectureCapability::majorversion = 5;
+const uint4 ArchitectureCapability::minorversion = 0;
 
+AttributeId ATTRIB_ADDRESS = AttributeId("address",148);
 AttributeId ATTRIB_ADJUSTVMA = AttributeId("adjustvma",103);
 AttributeId ATTRIB_ENABLE = AttributeId("enable",104);
 AttributeId ATTRIB_GROUP = AttributeId("group",105);
@@ -221,9 +223,9 @@ Architecture::~Architecture(void)
 
 /// The Architecture maintains the set of prototype models that can
 /// be applied for this particular executable. Retrieve one by name.
-/// The model must exist or an exception is thrown.
+/// If the model doesn't exist, null is returned.
 /// \param nm is the name
-/// \return the matching model
+/// \return the matching model or null
 ProtoModel *Architecture::getModel(const string &nm) const
 
 {
@@ -231,7 +233,7 @@ ProtoModel *Architecture::getModel(const string &nm) const
 
   iter = protoModels.find(nm);
   if (iter==protoModels.end())
-    throw LowlevelError("Prototype model does not exist: "+nm);
+    return (ProtoModel *)0;
   return (*iter).second;
 }
 
@@ -312,11 +314,14 @@ int4 Architecture::getMinimumLanedRegisterSize(void) const
 
 /// The default model is used whenever an explicit model is not known
 /// or can't be determined.
-/// \param nm is the name of the model to set
-void Architecture::setDefaultModel(const string &nm)
+/// \param model is the ProtoModel object to make the default
+void Architecture::setDefaultModel(ProtoModel *model)
 
 {
-  defaultfp = getModel(nm);
+  if (defaultfp != (ProtoModel *)0)
+    defaultfp->setPrintInDecl(true);
+  model->setPrintInDecl(false);
+  defaultfp = model;
 }
 
 /// Throw out the syntax tree, (unlocked) symbols, comments, and other derived information
@@ -580,15 +585,6 @@ void Architecture::buildAction(DocumentStorage &store)
   allacts.resetDefaults();
 }
 
-/// This builds the database which holds the status registers setings and other
-/// information that can affect disassembly depending on context.
-/// \param store may hold configuration information
-void Architecture::buildContext(DocumentStorage &store)
-
-{
-  context = new ContextInternal();
-}
-
 /// Create the database object, which currently doesn't not depend on any configuration
 /// data.  Then create the root (global) scope and attach it to the database.
 /// \param store is the storage for any configuration data
@@ -600,72 +596,6 @@ Scope *Architecture::buildDatabase(DocumentStorage &store)
   Scope *globscope = new ScopeInternal(0,"",this);
   symboltab->attachScope(globscope,(Scope *)0);
   return globscope;
-}
-
-/// This builds the TypeFactory object specific to this architecture and
-/// prepopulates it with the \e core types. Core types may be pulled
-/// from the configuration information, or default core types are used.
-/// \param store contains possible configuration information
-void Architecture::buildTypegrp(DocumentStorage &store)
-
-{
-  const Element *el = store.getTag("coretypes");
-  types = new TypeFactory(this); // Initialize the object
-  if (el != (const Element *)0) {
-    XmlDecode decoder(this,el);
-    types->decodeCoreTypes(decoder);
-  }
-  else {
-    // Put in the core types
-    types->setCoreType("void",1,TYPE_VOID,false);
-    types->setCoreType("bool",1,TYPE_BOOL,false);
-    types->setCoreType("uint1",1,TYPE_UINT,false);
-    types->setCoreType("uint2",2,TYPE_UINT,false);
-    types->setCoreType("uint4",4,TYPE_UINT,false);
-    types->setCoreType("uint8",8,TYPE_UINT,false);
-    types->setCoreType("int1",1,TYPE_INT,false);
-    types->setCoreType("int2",2,TYPE_INT,false);
-    types->setCoreType("int4",4,TYPE_INT,false);
-    types->setCoreType("int8",8,TYPE_INT,false);
-    types->setCoreType("float4",4,TYPE_FLOAT,false);
-    types->setCoreType("float8",8,TYPE_FLOAT,false);
-    types->setCoreType("float10",10,TYPE_FLOAT,false);
-    types->setCoreType("float16",16,TYPE_FLOAT,false);
-    types->setCoreType("xunknown1",1,TYPE_UNKNOWN,false);
-    types->setCoreType("xunknown2",2,TYPE_UNKNOWN,false);
-    types->setCoreType("xunknown4",4,TYPE_UNKNOWN,false);
-    types->setCoreType("xunknown8",8,TYPE_UNKNOWN,false);
-    types->setCoreType("code",1,TYPE_CODE,false);
-    types->setCoreType("char",1,TYPE_INT,true);
-    types->setCoreType("wchar2",2,TYPE_INT,true);
-    types->setCoreType("wchar4",4,TYPE_INT,true);
-    types->cacheCoreTypes();
-  }
-}
-
-/// Build the container that holds comments for executable in this Architecture.
-/// \param store may hold configuration information
-void Architecture::buildCommentDB(DocumentStorage &store)
-
-{
-  commentdb = new CommentDatabaseInternal();
-}
-
-/// Build container that holds decoded strings
-/// \param store may hold configuration information
-void Architecture::buildStringManager(DocumentStorage &store)
-
-{
-  stringManager = new StringManagerUnicode(this,2048);
-}
-
-/// Some processor models (Java byte-code) need a database of constants.
-/// The database is always built, but may remain empty.
-/// \param store may hold configuration information
-void Architecture::buildConstantPool(DocumentStorage &store)
-
-{
-  cpool = new ConstantPoolInternal();
 }
 
 /// This registers the OpBehavior objects for all known p-code OpCodes.
@@ -817,7 +747,7 @@ ProtoModel *Architecture::decodeProto(Decoder &decoder)
 
   res->decode(decoder);
   
-  ProtoModel *other = protoModels[res->getName()];
+  ProtoModel *other = getModel(res->getName());
   if (other != (ProtoModel *)0) {
     string errMsg = "Duplicate ProtoModel name: " + res->getName();
     delete res;
@@ -836,7 +766,7 @@ void Architecture::decodeProtoEval(Decoder &decoder)
 {
   uint4 elemId = decoder.openElement();
   string modelName = decoder.readString(ATTRIB_NAME);
-  ProtoModel *res = protoModels[ modelName ];
+  ProtoModel *res = getModel(modelName);
   if (res == (ProtoModel *)0)
     throw LowlevelError("Unknown prototype model name: "+modelName);
 
@@ -864,7 +794,8 @@ void Architecture::decodeDefaultProto(Decoder &decoder)
   while(decoder.peekElement() != 0) {
     if (defaultfp != (ProtoModel *)0)
       throw LowlevelError("More than one default prototype model");
-    defaultfp = decodeProto(decoder);
+    ProtoModel *model = decodeProto(decoder);
+    setDefaultModel(model);
   }
   decoder.closeElement(elemId);
 }
@@ -1192,6 +1123,20 @@ void Architecture::createModelAlias(const string &aliasName,const string &parent
   protoModels[aliasName] = new ProtoModel(aliasName,*model);
 }
 
+/// A new UnknownProtoModel, which clones its behavior from the default model, is created and associated with the
+/// unrecognized name.  Subsequent queries of the name return this new model.
+/// \param modelName is the unrecognized name
+/// \return the new \e unknown prototype model associated with the name
+ProtoModel *Architecture::createUnknownModel(const string &modelName)
+
+{
+  UnknownProtoModel *model = new UnknownProtoModel(modelName,defaultfp);
+  protoModels[modelName] = model;
+  if (modelName == "unknown")		// "unknown" is a reserved/internal name
+    model->setPrintInDecl(false);	// don't print it in declarations
+  return model;
+}
+
 /// This looks for the \<processor_spec> tag and and sets configuration
 /// parameters based on it.
 /// \param store is the document store holding the tag
@@ -1239,6 +1184,7 @@ void Architecture::parseProcessorConfig(DocumentStorage &store)
     }
     else if (subId == ELEM_DEFAULT_SYMBOLS) {
       decoder.openElement();
+      store.registerTag(decoder.getCurrentXmlElement());
       decoder.closeElementSkipping(subId);
     }
     else if (subId == ELEM_DEFAULT_MEMORY_BLOCKS) {
@@ -1360,8 +1306,8 @@ void Architecture::parseCompilerConfig(DocumentStorage &store)
   addOtherSpace();
       
   if (defaultfp == (ProtoModel *)0) {
-    if (protoModels.size() == 1)
-      defaultfp = (*protoModels.begin()).second;
+    if (protoModels.size() > 0)
+      setDefaultModel((*protoModels.begin()).second);
     else
       throw LowlevelError("No default prototype specified");
   }
@@ -1431,6 +1377,7 @@ void Architecture::init(DocumentStorage &store)
   restoreFromSpec(store);
   print->initializeFromArchitecture();
   symboltab->adjustCaches();	// In case the specs created additional address spaces
+  buildSymbols(store);
   postSpecFile();		// Let subclasses do things after translate is ready
 
   buildInstructions(store); // Must be called after translate is built

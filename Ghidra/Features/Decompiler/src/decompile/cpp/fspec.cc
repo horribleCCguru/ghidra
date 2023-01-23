@@ -926,6 +926,8 @@ void ParamListStandard::forceExclusionGroup(ParamActive *active)
   int4 inactiveCount = 0;
   for(int4 i=0;i<numTrials;++i) {
     ParamTrial &curtrial(active->getTrial(i));
+    if (curtrial.isDefinitelyNotUsed() || !curtrial.getEntry()->isExclusion())
+         continue;
     int4 grp = curtrial.getEntry()->getGroup();
     if (grp != curGroup) {
       if (inactiveCount > 1)
@@ -934,13 +936,12 @@ void ParamListStandard::forceExclusionGroup(ParamActive *active)
       groupStart = i;
       inactiveCount = 0;
     }
-    if (curtrial.isDefinitelyNotUsed() || !curtrial.getEntry()->isExclusion())
-      continue;
-    else if (!curtrial.isActive())
-      inactiveCount += 1;
-    else if (curtrial.isActive()) {
+    if (curtrial.isActive()) {
       int4 groupUpper = grp + curtrial.getEntry()->getGroupSize() - 1; // This entry covers some number of groups
       markGroupNoUse(active, groupUpper, groupStart, i);
+    }
+    else {
+      inactiveCount += 1;
     }
   }
   if (inactiveCount > 1)
@@ -2104,6 +2105,7 @@ ProtoModel::ProtoModel(Architecture *g)
   stackgrowsnegative = true;	// Normal stack parameter ordering
   hasThis = false;
   isConstruct = false;
+  isPrinted = true;
   defaultLocalRange();
   defaultParamRange();
 }
@@ -2116,6 +2118,7 @@ ProtoModel::ProtoModel(const string &nm,const ProtoModel &op2)
 {
   glb = op2.glb;
   name = nm;
+  isPrinted = true;		// Don't inherit. Always print unless setPrintInDecl called explicitly
   extrapop = op2.extrapop;
   if (op2.input != (ParamList *)0)
     input = op2.input->clone();
@@ -2302,6 +2305,7 @@ void ProtoModel::decode(Decoder &decoder)
   extrapop = -300;
   hasThis = false;
   isConstruct = false;
+  isPrinted = true;
   effectlist.clear();
   injectUponEntry = -1;
   injectUponReturn = -1;
@@ -3546,7 +3550,6 @@ void FuncProto::setModel(ProtoModel *m)
     model = m;
     extrapop = ProtoModel::extrapop_unknown;
   }
-  flags &= ~((uint4)unknown_model);	// Model is not "unknown" (even if null pointer is passed in)
 }
 
 /// The full function prototype is (re)set from a model, names, and data-types
@@ -3738,6 +3741,19 @@ void FuncProto::clearInput(void)
 {
   store->clearAllInputs();
   flags &= ~((uint4)voidinputlock); // If a void was locked in clear it
+}
+
+/// Set the id directly.
+/// \param id is the new id
+void FuncProto::setInjectId(int4 id)
+
+{
+  if (id < 0)
+    cancelInjectId();
+  else {
+    injectid = id;
+    flags |= is_inline;
+  }
 }
 
 void FuncProto::cancelInjectId(void)
@@ -4374,7 +4390,6 @@ void FuncProto::decode(Decoder &decoder,Architecture *glb)
     throw LowlevelError("Prototype storage must be set before restoring FuncProto");
   ProtoModel *mod = (ProtoModel *)0;
   bool seenextrapop = false;
-  bool seenunknownmod = false;
   int4 readextrapop;
   flags = 0;
   injectid = -1;
@@ -4384,14 +4399,13 @@ void FuncProto::decode(Decoder &decoder,Architecture *glb)
     if (attribId == 0) break;
     if (attribId == ATTRIB_MODEL) {
       string modelname = decoder.readString();
-      if ((modelname == "default")||(modelname.size()==0))
-	mod = glb->defaultfp;	// Get default model
-      else if (modelname == "unknown") {
-	mod = glb->defaultfp;		// Use the default
-	seenunknownmod = true;
-      }
-      else
+      if (modelname.size()==0 || modelname == "default")
+	mod = glb->defaultfp;	// Use the default model
+      else {
 	mod = glb->getModel(modelname);
+	if (mod == (ProtoModel *)0)	// Model name is unrecognized
+	  mod = glb->createUnknownModel(modelname);	// Create model with placeholder behavior
+      }
     }
     else if (attribId == ATTRIB_EXTRAPOP) {
       seenextrapop = true;
@@ -4438,8 +4452,6 @@ void FuncProto::decode(Decoder &decoder,Architecture *glb)
     setModel(mod);		// This sets extrapop to model default
   if (seenextrapop)		// If explicitly set
     extrapop = readextrapop;
-  if (seenunknownmod)
-    flags |= unknown_model;
 
   uint4 subId = decoder.peekElement();
   if (subId != 0) {
@@ -4894,7 +4906,7 @@ void FuncCallSpecs::commitNewOutputs(Funcdata &data,Varnode *newout)
     // We could conceivably truncate the output to the correct size to match the parameter
     activeoutput.registerTrial(param->getAddress(),param->getSize());
     PcodeOp *indop = newout->getDef();
-    if (newout->getSize() == 1 && param->getType()->getMetatype() == TYPE_BOOL)
+    if (newout->getSize() == 1 && param->getType()->getMetatype() == TYPE_BOOL && data.isTypeRecoveryOn())
       data.opMarkCalculatedBool(op);
     if (newout->getSize() == param->getSize()) {
       if (indop != op) {
@@ -5099,8 +5111,6 @@ void FuncCallSpecs::deindirect(Funcdata &data,Funcdata *newfd)
   Varnode *vn = data.newVarnodeCallSpecs(this);
   data.opSetInput(op,vn,0);
   data.opSetOpcode(op,CPUI_CALL);
-  if (isOverride())	// If we are overridden at the call-site
-    return;		// Don't use the discovered function prototype
 
   data.getOverride().insertIndirectOverride(op->getAddr(),entryaddress);
 
@@ -5109,14 +5119,17 @@ void FuncCallSpecs::deindirect(Funcdata &data,Funcdata *newfd)
   vector<Varnode *> newinput;
   Varnode *newoutput;
   FuncProto &newproto( newfd->getFuncProto() );
-  if ((!newproto.isNoReturn())&&(!newproto.isInline())&&
-      lateRestriction(newproto,newinput,newoutput)) {
-    commitNewInputs(data,newinput);
-    commitNewOutputs(data,newoutput);
+  if ((!newproto.isNoReturn())&&(!newproto.isInline())) {
+    if (isOverride())	// If we are overridden at the call-site
+      return;		// Don't use the discovered function prototype
+
+    if (lateRestriction(newproto,newinput,newoutput)) {
+      commitNewInputs(data,newinput);
+      commitNewOutputs(data,newoutput);
+      return;	// We have successfully updated the prototype, don't restart
+    }
   }
-  else {
-    data.setRestartPending(true);
-  }
+  data.setRestartPending(true);
 }
 
 /// \brief Force a more restrictive prototype on \b this call site

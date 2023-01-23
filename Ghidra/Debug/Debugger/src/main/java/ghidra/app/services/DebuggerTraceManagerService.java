@@ -25,6 +25,7 @@ import ghidra.framework.model.DomainFile;
 import ghidra.framework.plugintool.ServiceInfo;
 import ghidra.program.model.listing.Program;
 import ghidra.trace.model.Trace;
+import ghidra.trace.model.guest.TracePlatform;
 import ghidra.trace.model.program.TraceProgramView;
 import ghidra.trace.model.target.TraceObject;
 import ghidra.trace.model.thread.TraceThread;
@@ -36,6 +37,49 @@ import ghidra.util.TriConsumer;
  */
 @ServiceInfo(defaultProvider = DebuggerTraceManagerServicePlugin.class)
 public interface DebuggerTraceManagerService {
+
+	/**
+	 * The reason coordinates were activated
+	 */
+	public enum ActivationCause {
+		/**
+		 * The change was driven by the user
+		 * 
+		 * <p>
+		 * TODO: Distinguish between API and GUI?
+		 */
+		USER,
+		/**
+		 * A trace was activated because a recording was started, usually when a target is launched
+		 */
+		START_RECORDING,
+		/**
+		 * The change was driven by the model focus, possibly indirectly by the user
+		 */
+		SYNC_MODEL,
+		/**
+		 * The change was driven by the recorder advancing a snapshot
+		 */
+		FOLLOW_PRESENT,
+		/**
+		 * The change was caused by a change to the mapper selection, probably indirectly by the
+		 * user
+		 */
+		MAPPER_CHANGED,
+		/**
+		 * Some default coordinates were activated
+		 * 
+		 * <p>
+		 * Please don't misunderstand this as the "default cause." Rather, e.g., when the current
+		 * trace is closed, and the manager needs to activate new coordinates, it is activating
+		 * "default coordinates."
+		 */
+		ACTIVATE_DEFAULT,
+		/**
+		 * The tool is restoring its data state
+		 */
+		RESTORE_STATE,
+	}
 
 	/**
 	 * An adapter that works nicely with an {@link AsyncReference}
@@ -68,7 +112,7 @@ public interface DebuggerTraceManagerService {
 	 * Get the current coordinates
 	 * 
 	 * <p>
-	 * This entails everything except the current address
+	 * This entails everything except the current address.
 	 * 
 	 * @return the current coordinates
 	 */
@@ -88,6 +132,13 @@ public interface DebuggerTraceManagerService {
 	 * @return the active trace, or null
 	 */
 	Trace getCurrentTrace();
+
+	/**
+	 * Get the active platform
+	 * 
+	 * @return the active platform, or null
+	 */
+	TracePlatform getCurrentPlatform();
 
 	/**
 	 * Get the active view
@@ -225,11 +276,22 @@ public interface DebuggerTraceManagerService {
 	 * thread for the desired trace.
 	 * 
 	 * @param coordinates the desired coordinates
+	 * @param cause the cause of the activation
 	 * @param syncTargetFocus true synchronize the current target to the same coordinates
 	 * @return a future which completes when emulation and navigation is complete
 	 */
 	CompletableFuture<Void> activateAndNotify(DebuggerCoordinates coordinates,
-			boolean syncTargetFocus);
+			ActivationCause cause, boolean syncTargetFocus);
+
+	/**
+	 * Activate the given coordinates, caused by the user
+	 * 
+	 * @see #activate(DebuggerCoordinates, ActivationCause)
+	 * @param coordinates the desired coordinates
+	 */
+	default void activate(DebuggerCoordinates coordinates) {
+		activate(coordinates, ActivationCause.USER);
+	}
 
 	/**
 	 * Activate the given coordinates, synchronizing the current target, if possible
@@ -239,8 +301,9 @@ public interface DebuggerTraceManagerService {
 	 * {@link #activateAndNotify(DebuggerCoordinates, boolean)}.
 	 * 
 	 * @param coordinates the desired coordinates
+	 * @param cause the cause of activation
 	 */
-	void activate(DebuggerCoordinates coordinates);
+	void activate(DebuggerCoordinates coordinates, ActivationCause cause);
 
 	/**
 	 * Resolve coordinates for the given trace using the manager's "best judgment"
@@ -261,6 +324,24 @@ public interface DebuggerTraceManagerService {
 	 */
 	default void activateTrace(Trace trace) {
 		activate(resolveTrace(trace));
+	}
+
+	/**
+	 * Resolve coordinates for the given platform using the manager's "best judgment"
+	 * 
+	 * @see #resolveTrace(Trace)
+	 * @param platform the platform
+	 * @return the best coordinates
+	 */
+	DebuggerCoordinates resolvePlatform(TracePlatform platform);
+
+	/**
+	 * Activate the given platform
+	 * 
+	 * @param platform the desired platform
+	 */
+	default void activatePlatform(TracePlatform platform) {
+		activate(resolvePlatform(platform));
 	}
 
 	/**
@@ -361,38 +442,6 @@ public interface DebuggerTraceManagerService {
 	default void activateObject(TraceObject object) {
 		activate(resolveObject(object));
 	}
-
-	/**
-	 * Control whether the trace manager automatically activates the "present snapshot"
-	 * 
-	 * <p>
-	 * Auto activation only applies when the current trace advances. It never changes to another
-	 * trace.
-	 * 
-	 * @param enabled true to enable auto activation
-	 */
-	void setAutoActivatePresent(boolean enabled);
-
-	/**
-	 * Check if the trace manager automatically activate the "present snapshot"
-	 * 
-	 * @return true if auto activation is enabled
-	 */
-	boolean isAutoActivatePresent();
-
-	/**
-	 * Add a listener for changes to auto activation enablement
-	 * 
-	 * @param listener the listener to receive change notifications
-	 */
-	void addAutoActivatePresentChangeListener(BooleanChangeAdapter listener);
-
-	/**
-	 * Remove a listener for changes to auto activation enablement
-	 * 
-	 * @param listener the listener receiving change notifications
-	 */
-	void removeAutoActivatePresentChangeListener(BooleanChangeAdapter listener);
 
 	/**
 	 * Control whether trace activation is synchronized with debugger focus/select

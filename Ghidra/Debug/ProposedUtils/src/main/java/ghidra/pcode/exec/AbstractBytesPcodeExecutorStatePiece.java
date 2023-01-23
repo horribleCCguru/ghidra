@@ -16,11 +16,13 @@
 package ghidra.pcode.exec;
 
 import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Map;
 
-import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.util.Msg;
@@ -68,13 +70,14 @@ public abstract class AbstractBytesPcodeExecutorStatePiece<S extends BytesPcodeE
 
 		@Override
 		public int getBytes(ByteBuffer buffer, int addressOffset) {
-			byte[] data = source.read(address.getOffset() + addressOffset, buffer.remaining());
+			byte[] data = source.read(address.getOffset() + addressOffset, buffer.remaining(),
+				Reason.EXECUTE);
 			buffer.put(data);
 			return data.length;
 		}
 	}
 
-	protected final AbstractSpaceMap<S> spaceMap = newSpaceMap();
+	protected final AbstractSpaceMap<S> spaceMap;
 
 	/**
 	 * Construct a state for the given language
@@ -83,6 +86,11 @@ public abstract class AbstractBytesPcodeExecutorStatePiece<S extends BytesPcodeE
 	 */
 	public AbstractBytesPcodeExecutorStatePiece(Language language) {
 		this(language, BytesPcodeArithmetic.forLanguage(language));
+	}
+
+	protected AbstractBytesPcodeExecutorStatePiece(Language language,
+			AbstractSpaceMap<S> spaceMap) {
+		this(language, BytesPcodeArithmetic.forLanguage(language), spaceMap);
 	}
 
 	/**
@@ -94,6 +102,13 @@ public abstract class AbstractBytesPcodeExecutorStatePiece<S extends BytesPcodeE
 	public AbstractBytesPcodeExecutorStatePiece(Language language,
 			PcodeArithmetic<byte[]> arithmetic) {
 		super(language, arithmetic, arithmetic);
+		spaceMap = newSpaceMap();
+	}
+
+	protected AbstractBytesPcodeExecutorStatePiece(Language language,
+			PcodeArithmetic<byte[]> arithmetic, AbstractSpaceMap<S> spaceMap) {
+		super(language, arithmetic, arithmetic);
+		this.spaceMap = spaceMap;
 	}
 
 	/**
@@ -129,8 +144,8 @@ public abstract class AbstractBytesPcodeExecutorStatePiece<S extends BytesPcodeE
 	}
 
 	@Override
-	protected byte[] getFromSpace(S space, long offset, int size) {
-		byte[] read = space.read(offset, size);
+	protected byte[] getFromSpace(S space, long offset, int size, Reason reason) {
+		byte[] read = space.read(offset, size, reason);
 		if (read.length != size) {
 			throw new AccessPcodeExecutionException("Incomplete read (" + read.length +
 				" of " + size + " bytes)");
@@ -139,7 +154,19 @@ public abstract class AbstractBytesPcodeExecutorStatePiece<S extends BytesPcodeE
 	}
 
 	@Override
-	public MemBuffer getConcreteBuffer(Address address, Purpose purpose) {
+	protected Map<Register, byte[]> getRegisterValuesFromSpace(S s, List<Register> registers) {
+		return s.getRegisterValues(registers);
+	}
+
+	@Override
+	public MemBuffer getConcreteBuffer(Address address, PcodeArithmetic.Purpose purpose) {
 		return new StateMemBuffer(address, getForSpace(address.getAddressSpace(), false));
+	}
+
+	@Override
+	public void clear() {
+		for (S space : spaceMap.values()) {
+			space.clear();
+		}
 	}
 }

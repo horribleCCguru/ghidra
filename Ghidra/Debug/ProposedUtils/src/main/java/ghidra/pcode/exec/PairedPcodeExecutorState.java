@@ -15,11 +15,15 @@
  */
 package ghidra.pcode.exec;
 
+import java.util.Map;
+
 import org.apache.commons.lang3.tuple.Pair;
 
 import ghidra.pcode.exec.PcodeArithmetic.Purpose;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.mem.MemBuffer;
 
 /**
@@ -72,8 +76,23 @@ public class PairedPcodeExecutorState<L, R> implements PcodeExecutorState<Pair<L
 	}
 
 	@Override
+	public Language getLanguage() {
+		return piece.getLanguage();
+	}
+
+	@Override
 	public PcodeArithmetic<Pair<L, R>> getArithmetic() {
 		return arithmetic;
+	}
+
+	@Override
+	public Map<Register, Pair<L, R>> getRegisterValues() {
+		return piece.getRegisterValues();
+	}
+
+	@Override
+	public PairedPcodeExecutorState<L, R> fork() {
+		return new PairedPcodeExecutorState<>(piece.fork());
 	}
 
 	@Override
@@ -106,7 +125,13 @@ public class PairedPcodeExecutorState<L, R> implements PcodeExecutorState<Pair<L
 	}
 
 	@Override
-	public Pair<L, R> getVar(AddressSpace space, Pair<L, R> offset, int size, boolean quantize) {
-		return piece.getVar(space, offset.getLeft(), size, quantize);
+	public Pair<L, R> getVar(AddressSpace space, Pair<L, R> offset, int size, boolean quantize,
+			Reason reason) {
+		return piece.getVar(space, offset.getLeft(), size, quantize, reason);
+	}
+
+	@Override
+	public void clear() {
+		piece.clear();
 	}
 }
